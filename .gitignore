@@ -1,0 +1,28 @@
+# Local configuration can contain machine-specific paths or credentials.
+config/*.yaml
+!config/example.yaml
+
+# Runtime state and generated output.
+*.sqlite
+*.sqlite3
+state/
+logs/
+manifests/
+*.log
+
+# Python tooling.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Editors and operating systems.
+.DS_Store
+.idea/
+.vscode/

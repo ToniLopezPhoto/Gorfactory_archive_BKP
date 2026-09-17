@@ -1,0 +1,45 @@
+# gorbackup
+
+`gorbackup` is the command-line entry point for the Gorfactory archive backup
+system. This initial version establishes configuration and dependency checks;
+backup operations are deliberately placeholders and do not read or write the
+configured source or archive.
+
+## Requirements
+
+- Python 3.9 or newer
+- `rclone` 1.65.0 or newer on `PATH`
+
+## Setup from a fresh clone
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
+cp config/example.yaml config/config.yaml
+gorbackup --help
+gorbackup --config config/config.yaml status
+```
+
+Edit `config/config.yaml` for the local machine. It is ignored by Git and must
+not be committed. The example paths are illustrative only.
+
+Every operational command validates the configuration and the installed
+`rclone` version before reporting its placeholder status. It does not touch the
+source or destination. See [docs/configuration.md](docs/configuration.md) for
+the available settings.
+
+## Development
+
+```sh
+python -m pytest
+```
+
+Project directories are organized as follows:
+
+- `src/gorbackup/`: application package and CLI
+- `config/`: tracked example and ignored local configuration
+- `scripts/`: maintenance and installation helpers
+- `launchd/`: macOS scheduling definitions
+- `tests/`: automated tests
+- `docs/`: user and operator documentation

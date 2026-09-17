@@ -1,0 +1,21 @@
+source:
+  path: /Volumes/SOURCE/catalogue
+
+archive:
+  root: /Volumes/ARCHIVE
+  current_dir: current
+  history_dir: history
+
+safety:
+  max_deletes_per_run: 500
+  max_delete_size_gb: 50
+  min_free_space_percent: 15
+  ignore_recent_minutes: 15
+
+retention:
+  auto_prune: false
+
+logging:
+  level: INFO
+  directory: logs
+  keep_days: 30
