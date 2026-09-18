@@ -7,6 +7,7 @@ from typing import Optional, Sequence
 
 from gorbackup import __version__
 from gorbackup.baseline import BaselineError, adopt_baseline, load_baseline_summary
+from gorbackup.backup import BackupError, run_backup
 from gorbackup.config import ConfigError, load_config
 from gorbackup.dependencies import DependencyError, check_rclone
 from gorbackup.ledger import LedgerError, scan_catalogue
@@ -43,7 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
         subparser = subparsers.add_parser(
             command,
             help=(
-                "verify and adopt an existing first dump"
+                "run a versioned incremental backup"
+                if command == "backup"
+                else "verify and adopt an existing first dump"
                 if command == "baseline"
                 else "inventory catalogue metadata"
                 if command == "scan"
@@ -52,7 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
                 else f"{command} operation (placeholder)"
             ),
             description=(
-                "Verify an existing archive copy and record a trusted baseline."
+                "Plan and sync the source while preserving displaced files in history."
+                if command == "backup"
+                else "Verify an existing archive copy and record a trusted baseline."
                 if command == "baseline"
                 else "Scan source metadata and update the SQLite inventory."
                 if command == "scan"
@@ -90,6 +95,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 preflight,
                 reconcile=args.reconcile,
             )
+        if args.command == "backup":
+            backup_result = run_backup(config, rclone)
         if args.command == "scan":
             scan_result = scan_catalogue(config)
         if args.command == "plan":
@@ -101,6 +108,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         BaselineError,
         LedgerError,
         PlanError,
+        BackupError,
     ) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
@@ -111,6 +119,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             f"baseline: {action}; manifest={result.manifest_path}; "
             f"destination_extras={extras}"
+        )
+        return 0
+
+    if args.command == "backup":
+        print(
+            f"backup: success; run_id={backup_result.run_id}; "
+            f"plan_run_id={backup_result.plan_run_id}; "
+            f"transferred_files={backup_result.transferred_files}; "
+            f"transferred_bytes={backup_result.transferred_bytes}; "
+            f"archived_files={backup_result.archived_files}; "
+            f"archived_bytes={backup_result.archived_bytes}; "
+            f"history={backup_result.history_path}; "
+            f"manifest={backup_result.manifest_path}"
         )
         return 0
 
