@@ -1,5 +1,7 @@
 # gorbackup
 
+[![CI](https://github.com/ToniLopezPhoto/Gorfactory_archive_BKP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ToniLopezPhoto/Gorfactory_archive_BKP/actions/workflows/ci.yml)
+
 `gorbackup` is the command-line entry point for the Gorfactory archive backup
 system. It includes configuration, dependency and preflight checks, baseline
 adoption, dry-run planning, and versioned incremental synchronization.
