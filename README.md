@@ -46,6 +46,15 @@ gorbackup --config config/config.yaml baseline --reconcile
 
 See [docs/baseline.md](docs/baseline.md) for the adoption workflow.
 
+To inventory the catalogue using path, size and modification-time metadata only:
+
+```sh
+gorbackup --config config/config.yaml scan
+```
+
+The scan updates the SQLite ledger only after the complete catalogue has been
+read successfully. See [docs/ledger.md](docs/ledger.md).
+
 ## Development
 
 ```sh

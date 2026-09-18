@@ -66,18 +66,21 @@ class DiskUsage(Protocol):
 
 def _ensure_state_is_outside_source(config: AppConfig) -> None:
     source = config.source.path.resolve()
-    state = config.state.directory.resolve()
+    archive = config.archive.root.resolve()
+    state = config.state_root.resolve()
     if state == source or source in state.parents:
         raise BaselineError(
             f"state directory must not be inside the read-only source: {state}"
         )
+    if state != archive and archive not in state.parents:
+        raise BaselineError(f"state directory must live under archive root: {state}")
 
 
 def load_baseline_summary(config: AppConfig) -> Optional["SourceSummary"]:
     """Load the known-good summary used by later preflight comparisons."""
     from gorbackup.preflight import SourceSummary
 
-    path = config.state.directory / config.state.baseline_manifest
+    path = config.manifests_root / config.state.baseline_manifest
     if not path.exists():
         return None
     try:
@@ -168,9 +171,9 @@ def compare_with_rclone(
 ) -> ComparisonReport:
     """Run a non-destructive rclone check and return its structured report."""
     _ensure_state_is_outside_source(config)
-    config.state.directory.mkdir(parents=True, exist_ok=True)
+    config.state_root.mkdir(parents=True, exist_ok=True)
     descriptor, report_name = tempfile.mkstemp(
-        prefix=".rclone-check-", suffix=".txt", dir=str(config.state.directory)
+        prefix=".rclone-check-", suffix=".txt", dir=str(config.state_root)
     )
     os.close(descriptor)
     report_path = Path(report_name)
@@ -247,7 +250,7 @@ def adopt_baseline(
     """Verify, optionally reconcile, and atomically persist a trusted baseline."""
     started_at = now()
     comparison = compare_with_rclone(rclone, config, runner=runner)
-    report_path = config.state.directory / config.state.baseline_report
+    report_path = config.manifests_root / config.state.baseline_report
     report_payload: Dict[str, object] = {
         "schema_version": 1,
         "checked_at": started_at.isoformat(),
@@ -292,7 +295,7 @@ def adopt_baseline(
         final_free_percent = free_bytes / total_bytes * 100 if total_bytes else 0.0
     except OSError as exc:
         raise BaselineError(f"cannot record final archive free space: {exc}") from exc
-    manifest_path = config.state.directory / config.state.baseline_manifest
+    manifest_path = config.manifests_root / config.state.baseline_manifest
     manifest = {
         "schema_version": 1,
         "status": "known-good",
@@ -315,7 +318,7 @@ def adopt_baseline(
     _atomic_json(manifest_path, manifest)
 
     run_id = completed_at.strftime("%Y%m%dT%H%M%S.%fZ")
-    run_path = config.state.directory / "runs" / f"baseline-{run_id}.json"
+    run_path = config.state_root / "runs" / f"baseline-{run_id}.json"
     _atomic_json(
         run_path,
         {

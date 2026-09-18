@@ -38,7 +38,7 @@ def make_config(tmp_path: Path) -> AppConfig:
         SafetyConfig(10, 1, 10, 5, 0, 0.8),
         RetentionConfig(False),
         LoggingConfig(),
-        StateConfig(tmp_path / "state"),
+        StateConfig(Path("state")),
     )
 
 
@@ -98,7 +98,7 @@ def test_matching_dump_is_adopted_and_extras_are_only_reported(tmp_path: Path) -
     assert manifest["source"]["file_count"] == 2
     assert manifest["archive"]["free_bytes"] == 750
     assert manifest["verification"]["destination_extras"][0]["path"] == "review-me.tif"
-    assert list((config.state.directory / "runs").glob("baseline-*.json"))
+    assert list((config.state_root / "runs").glob("baseline-*.json"))
 
 
 def test_differences_require_explicit_reconciliation(tmp_path: Path) -> None:
@@ -115,8 +115,8 @@ def test_differences_require_explicit_reconciliation(tmp_path: Path) -> None:
         )
 
     assert [command[1] for command in commands] == ["check"]
-    assert not (config.state.directory / config.state.baseline_manifest).exists()
-    assert (config.state.directory / config.state.baseline_report).exists()
+    assert not (config.manifests_root / config.state.baseline_manifest).exists()
+    assert (config.manifests_root / config.state.baseline_report).exists()
 
 
 def test_reconciliation_uses_copy_then_rechecks_without_deleting(tmp_path: Path) -> None:
@@ -146,8 +146,8 @@ def test_reconciliation_uses_copy_then_rechecks_without_deleting(tmp_path: Path)
 
 def test_known_good_manifest_loads_preflight_summary(tmp_path: Path) -> None:
     config = make_config(tmp_path)
-    config.state.directory.mkdir()
-    (config.state.directory / config.state.baseline_manifest).write_text(
+    config.manifests_root.mkdir(parents=True)
+    (config.manifests_root / config.state.baseline_manifest).write_text(
         json.dumps(
             {
                 "status": "known-good",

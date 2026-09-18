@@ -29,5 +29,7 @@ logging:
 
 state:
   directory: state
+  manifests_dir: manifests
+  ledger_file: gorbackup.sqlite3
   baseline_manifest: baseline.json
   baseline_report: baseline-report.json
