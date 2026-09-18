@@ -50,3 +50,7 @@ The ledger API can return:
 Run rows include source and destination identities plus counters for copied, moved
 and archived bytes. Those transfer counters remain zero for metadata-only scans
 and are ready for later backup workflows.
+
+Dry-run plans are stored in the same ledger through the `plans` and `plan_items`
+tables. Their run rows use operation `plan`; failed plans remain distinguishable
+and never affect the successful catalogue inventory.
