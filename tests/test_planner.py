@@ -87,7 +87,12 @@ def test_plan_is_dry_run_persisted_and_classifies_rename_and_recent(tmp_path: Pa
     (source / "renamed-new.tif").write_bytes(b"rename")
     (current / "renamed-old.tif").write_bytes(b"rename")
     old_ns = 1_700_000_000_000_000_000
-    os.utime(source / "renamed-new.tif", ns=(old_ns, old_ns))
+    for path in (
+        source / "new.tif",
+        source / "changed.tif",
+        source / "renamed-new.tif",
+    ):
+        os.utime(path, ns=(old_ns, old_ns))
     os.utime(current / "renamed-old.tif", ns=(old_ns, old_ns))
     (source / "recent.tif").write_bytes(b"recent")
     recent_ns = int(FIXED_TIME.timestamp() * 1_000_000_000)
