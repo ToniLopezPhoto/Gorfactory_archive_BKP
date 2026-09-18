@@ -14,6 +14,9 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class SourceConfig:
     path: Path
+    mount_path: Path
+    marker_file: str
+    marker_id: str
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,8 @@ class ArchiveConfig:
     root: Path
     current_dir: str
     history_dir: str
+    marker_file: str
+    marker_id: str
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,8 @@ class SafetyConfig:
     max_delete_size_gb: float
     min_free_space_percent: float
     ignore_recent_minutes: int
+    min_source_size_gb: float
+    min_source_size_ratio: float
 
 
 @dataclass(frozen=True)
@@ -98,17 +105,31 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("'logging' must be a mapping")
 
     source_path = _required(source, "source", "path")
+    source_mount = _required(source, "source", "mount_path")
+    source_marker = _required(source, "source", "marker_file")
+    source_marker_id = _required(source, "source", "marker_id")
     archive_root = _required(archive, "archive", "root")
     current_dir = _required(archive, "archive", "current_dir")
     history_dir = _required(archive, "archive", "history_dir")
     for name, value in (
         ("source.path", source_path),
+        ("source.mount_path", source_mount),
+        ("source.marker_file", source_marker),
+        ("source.marker_id", source_marker_id),
         ("archive.root", archive_root),
         ("archive.current_dir", current_dir),
         ("archive.history_dir", history_dir),
+        ("archive.marker_file", _required(archive, "archive", "marker_file")),
+        ("archive.marker_id", _required(archive, "archive", "marker_id")),
     ):
         if not isinstance(value, str) or not value.strip():
             raise ConfigError(f"'{name}' must be a non-empty string")
+    for name, value in (
+        ("source.marker_file", source_marker),
+        ("archive.marker_file", archive["marker_file"]),
+    ):
+        if Path(value).name != value:
+            raise ConfigError(f"'{name}' must be a filename, not a path")
 
     max_deletes = _required(safety, "safety", "max_deletes_per_run")
     ignore_recent = _required(safety, "safety", "ignore_recent_minutes")
@@ -126,6 +147,12 @@ def load_config(path: Path) -> AppConfig:
     )
     if free_percent > 100:
         raise ConfigError("'safety.min_free_space_percent' must not exceed 100")
+    source_ratio = _positive_number(
+        _required(safety, "safety", "min_source_size_ratio"),
+        "safety.min_source_size_ratio",
+    )
+    if source_ratio > 1:
+        raise ConfigError("'safety.min_source_size_ratio' must not exceed 1")
 
     auto_prune = _required(retention, "retention", "auto_prune")
     if not isinstance(auto_prune, bool):
@@ -144,8 +171,16 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("'logging.keep_days' must be a non-negative integer")
 
     return AppConfig(
-        source=SourceConfig(Path(source_path)),
-        archive=ArchiveConfig(Path(archive_root), current_dir, history_dir),
+        source=SourceConfig(
+            Path(source_path), Path(source_mount), source_marker, source_marker_id
+        ),
+        archive=ArchiveConfig(
+            Path(archive_root),
+            current_dir,
+            history_dir,
+            archive["marker_file"],
+            archive["marker_id"],
+        ),
         safety=SafetyConfig(
             max_deletes_per_run=max_deletes,
             max_delete_size_gb=_positive_number(
@@ -155,6 +190,12 @@ def load_config(path: Path) -> AppConfig:
             ),
             min_free_space_percent=free_percent,
             ignore_recent_minutes=ignore_recent,
+            min_source_size_gb=_positive_number(
+                _required(safety, "safety", "min_source_size_gb"),
+                "safety.min_source_size_gb",
+                allow_zero=True,
+            ),
+            min_source_size_ratio=source_ratio,
         ),
         retention=RetentionConfig(auto_prune=auto_prune),
         logging=LoggingConfig(level.upper(), Path(directory), keep_days),

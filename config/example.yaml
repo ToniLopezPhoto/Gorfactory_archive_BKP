@@ -1,16 +1,23 @@
 source:
   path: /Volumes/SOURCE/catalogue
+  mount_path: /Volumes/SOURCE
+  marker_file: .gorbackup-source
+  marker_id: gorfactory-sam
 
 archive:
   root: /Volumes/ARCHIVE
   current_dir: current
   history_dir: history
+  marker_file: .gorbackup-archive
+  marker_id: gorfactory-archive-primary
 
 safety:
   max_deletes_per_run: 500
   max_delete_size_gb: 50
   min_free_space_percent: 15
   ignore_recent_minutes: 15
+  min_source_size_gb: 3500
+  min_source_size_ratio: 0.8
 
 retention:
   auto_prune: false
