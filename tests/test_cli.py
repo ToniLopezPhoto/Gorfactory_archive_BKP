@@ -9,6 +9,7 @@ from gorbackup.baseline import BaselineResult, ComparisonReport
 from gorbackup.ledger import ScanResult
 from gorbackup.planner import PlanResult
 from gorbackup.preflight import PreflightError, PreflightResult, SourceSummary
+from gorbackup.safety import SafetyAssessment
 
 
 @pytest.mark.parametrize(
@@ -45,7 +46,9 @@ def test_missing_config_returns_error(
     assert "configuration file not found" in capsys.readouterr().err
 
 
-def test_backup_runs_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backup_runs_preflight(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     config = object()
     calls = []
     monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
@@ -67,6 +70,7 @@ def test_backup_runs_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
             10,
             1,
             5,
+            SafetyAssessment(1, 5, 10, 100, 90, 90.0),
             Path("history/backup-1"),
             Path("backup.json"),
         ),
@@ -74,6 +78,9 @@ def test_backup_runs_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert main(["--config", "unused.yaml", "backup"]) == 0
     assert calls == [config]
+    output = capsys.readouterr().out
+    assert "delete_count=1" in output
+    assert "projected_free_percent=90.0" in output
 
 
 def test_preflight_failure_returns_nonzero(
