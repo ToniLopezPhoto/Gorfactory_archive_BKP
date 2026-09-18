@@ -1,0 +1,3 @@
+{"time":"2026-09-18T12:00:00Z","level":"info","msg":"Copied (new)","object":"incoming/new-photo.tif","size":123}
+{"time":"2026-09-18T12:00:01Z","level":"warning","msg":"Excluded recent file","object":"recent.tif"}
+{"time":"2026-09-18T12:00:02Z","level":"error","msg":"failed to read object","object":"unreadable/broken.raw","size":456}

@@ -55,6 +55,15 @@ gorbackup --config config/config.yaml scan
 The scan updates the SQLite ledger only after the complete catalogue has been
 read successfully. See [docs/ledger.md](docs/ledger.md).
 
+To generate and persist a machine-readable dry-run before any backup execution:
+
+```sh
+gorbackup --config config/config.yaml plan
+```
+
+The preview reports transfer and `current/` departure counts/bytes, rename
+candidates, recent files and errors. See [docs/planning.md](docs/planning.md).
+
 ## Development
 
 ```sh

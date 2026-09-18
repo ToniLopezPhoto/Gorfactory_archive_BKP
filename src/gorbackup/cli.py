@@ -10,6 +10,7 @@ from gorbackup.baseline import BaselineError, adopt_baseline, load_baseline_summ
 from gorbackup.config import ConfigError, load_config
 from gorbackup.dependencies import DependencyError, check_rclone
 from gorbackup.ledger import LedgerError, scan_catalogue
+from gorbackup.planner import PlanError, create_plan
 from gorbackup.preflight import PreflightError, run_preflight
 
 COMMANDS = (
@@ -46,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
                 if command == "baseline"
                 else "inventory catalogue metadata"
                 if command == "scan"
+                else "generate a non-destructive backup plan"
+                if command == "plan"
                 else f"{command} operation (placeholder)"
             ),
             description=(
@@ -53,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
                 if command == "baseline"
                 else "Scan source metadata and update the SQLite inventory."
                 if command == "scan"
+                else "Run rclone in dry-run mode and persist a classified plan."
+                if command == "plan"
                 else f"Validate prerequisites for the future {command} operation."
             ),
         )
@@ -71,10 +76,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config = load_config(args.config)
         rclone = check_rclone()
         preflight = None
-        if args.command in {"backup", "baseline", "scan"}:
+        if args.command in {"backup", "baseline", "scan", "plan"}:
             baseline = (
                 load_baseline_summary(config)
-                if args.command in {"backup", "scan"}
+                if args.command in {"backup", "scan", "plan"}
                 else None
             )
             preflight = run_preflight(config, baseline=baseline)
@@ -87,12 +92,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         if args.command == "scan":
             scan_result = scan_catalogue(config)
+        if args.command == "plan":
+            plan_result = create_plan(config, rclone)
     except (
         ConfigError,
         DependencyError,
         PreflightError,
         BaselineError,
         LedgerError,
+        PlanError,
     ) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
@@ -113,6 +121,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"changed={scan_result.changed_files}; deleted={scan_result.deleted_paths}"
         )
         return 0
+
+    if args.command == "plan":
+        transfer_files = sum(
+            plan_result.counts[name]
+            for name in ("new_file", "changed_file", "rename_move_candidate")
+        )
+        leaving_files = sum(
+            plan_result.counts[name]
+            for name in (
+                "delete_from_current",
+                "changed_file",
+                "rename_move_candidate",
+            )
+        )
+        print(
+            f"plan: {plan_result.status}; run_id={plan_result.run_id}; "
+            f"transfer_files={transfer_files}; "
+            f"transfer_bytes={plan_result.transfer_bytes}; "
+            f"leave_current_files={leaving_files}; "
+            f"leave_current_bytes={plan_result.leaving_current_bytes}; "
+            f"rename_candidates={plan_result.counts['rename_move_candidate']}; "
+            f"skipped_recent={plan_result.counts['skipped_recent']}; "
+            f"errors={plan_result.counts['error']}; manifest={plan_result.manifest_path}"
+        )
+        return 0 if plan_result.status == "success" else 2
 
     version = ".".join(str(part) for part in rclone.version)
     print(

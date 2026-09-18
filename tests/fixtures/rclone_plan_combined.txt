@@ -1,0 +1,5 @@
+= unchanged.tif
++ incoming/new-photo.tif
+* changed/edit.tif
+- retired/old-photo.tif
+! unreadable/broken.raw

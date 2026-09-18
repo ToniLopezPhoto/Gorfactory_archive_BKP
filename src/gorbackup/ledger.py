@@ -86,10 +86,31 @@ CREATE TABLE IF NOT EXISTS file_changes (
     PRIMARY KEY (run_id, relative_path)
 );
 
+CREATE TABLE IF NOT EXISTS plans (
+    run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('success', 'failed')),
+    counts_json TEXT NOT NULL,
+    bytes_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES plans(run_id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    path TEXT NOT NULL,
+    related_path TEXT,
+    size INTEGER NOT NULL DEFAULT 0,
+    leaving_size INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_status_completed
     ON runs(status, completed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_file_changes_run_type
     ON file_changes(run_id, change_type);
+CREATE INDEX IF NOT EXISTS idx_plan_items_run_category
+    ON plan_items(run_id, category);
 """
 
 
@@ -115,7 +136,7 @@ def _atomic_json(path: Path, payload: object) -> None:
             temporary.unlink()
 
 
-def _validate_state_location(config: AppConfig) -> None:
+def validate_state_location(config: AppConfig) -> None:
     archive = config.archive.root.resolve()
     source = config.source.path.resolve()
     state_root = config.state_root.resolve()
@@ -152,6 +173,7 @@ class Ledger:
         started_at: str,
         source_identity: str,
         destination_identity: str,
+        operation: str = "scan",
     ) -> None:
         with self.connection:
             self.connection.execute(
@@ -159,10 +181,90 @@ class Ledger:
                 INSERT INTO runs (
                     run_id, operation, started_at, status,
                     source_identity, destination_identity
-                ) VALUES (?, 'scan', ?, 'running', ?, ?)
+                ) VALUES (?, ?, ?, 'running', ?, ?)
                 """,
-                (run_id, started_at, source_identity, destination_identity),
+                (
+                    run_id,
+                    operation,
+                    started_at,
+                    source_identity,
+                    destination_identity,
+                ),
             )
+
+    def save_plan(
+        self,
+        run_id: str,
+        completed_at: str,
+        status: str,
+        items: Sequence[Dict[str, object]],
+        counts: Dict[str, int],
+        byte_totals: Dict[str, int],
+        warnings: Sequence[str],
+        errors: Sequence[str],
+    ) -> None:
+        if status not in {"success", "failed"}:
+            raise LedgerError(f"invalid plan status: {status}")
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO plans
+                    (run_id, created_at, status, counts_json, bytes_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    completed_at,
+                    status,
+                    json.dumps(counts, sort_keys=True),
+                    json.dumps(byte_totals, sort_keys=True),
+                ),
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO plan_items
+                    (run_id, category, path, related_path, size, leaving_size, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        run_id,
+                        item["category"],
+                        item["path"],
+                        item.get("related_path"),
+                        item["size"],
+                        item["leaving_size"],
+                        item["reason"],
+                    )
+                    for item in items
+                ),
+            )
+            self.connection.execute(
+                """
+                UPDATE runs SET completed_at = ?, status = ?, file_count = ?,
+                    total_bytes = ?, warnings_json = ?, errors_json = ?
+                WHERE run_id = ? AND status = 'running'
+                """,
+                (
+                    completed_at,
+                    status,
+                    sum(counts.values()),
+                    sum(byte_totals.values()),
+                    json.dumps(list(warnings)),
+                    json.dumps(list(errors)),
+                    run_id,
+                ),
+            )
+
+    def plan_items(self, run_id: str) -> List[Dict[str, object]]:
+        rows = self.connection.execute(
+            """
+            SELECT category, path, related_path, size, leaving_size, reason
+            FROM plan_items WHERE run_id = ? ORDER BY item_id
+            """,
+            (run_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def stage_files(self, run_id: str, files: Iterable[FileMetadata]) -> None:
         with self.connection:
@@ -380,7 +482,7 @@ def scan_catalogue(
     inventory: Callable[[Path, str], Iterable[FileMetadata]] = inventory_source,
 ) -> ScanResult:
     """Inventory source metadata and publish it only after a complete scan."""
-    _validate_state_location(config)
+    validate_state_location(config)
     run_id = run_id_factory()
     started_at = now().isoformat()
     warnings: List[str] = []

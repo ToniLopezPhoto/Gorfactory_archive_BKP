@@ -6,11 +6,12 @@ import pytest
 from gorbackup.cli import COMMANDS, main
 from gorbackup.baseline import BaselineResult, ComparisonReport
 from gorbackup.ledger import ScanResult
+from gorbackup.planner import PlanResult
 from gorbackup.preflight import PreflightError, PreflightResult, SourceSummary
 
 
 @pytest.mark.parametrize(
-    "command", [item for item in COMMANDS if item not in {"baseline", "scan"}]
+    "command", [item for item in COMMANDS if item not in {"baseline", "scan", "plan"}]
 )
 def test_placeholder_commands_validate_without_touching_paths(
     command: str,
@@ -121,3 +122,61 @@ def test_scan_command_updates_inventory(
 
     assert main(["--config", "unused.yaml", "scan"]) == 0
     assert "run_id=run-1" in capsys.readouterr().out
+
+
+def test_plan_command_prints_machine_counts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = object()
+    counts = {
+        "new_file": 1,
+        "changed_file": 2,
+        "delete_from_current": 3,
+        "rename_move_candidate": 0,
+        "skipped_recent": 4,
+        "error": 0,
+    }
+    result = PlanResult(
+        "plan-1", "success", (), counts, {}, 100, 50, Path("plan.json")
+    )
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "gorbackup.cli.check_rclone",
+        lambda: SimpleNamespace(version=(1, 70, 0)),
+    )
+    monkeypatch.setattr("gorbackup.cli.load_baseline_summary", lambda value: None)
+    monkeypatch.setattr("gorbackup.cli.run_preflight", lambda *args, **kwargs: object())
+    monkeypatch.setattr("gorbackup.cli.create_plan", lambda *args: result)
+
+    assert main(["--config", "unused.yaml", "plan"]) == 0
+    output = capsys.readouterr().out
+    assert "transfer_bytes=100" in output
+    assert "leave_current_files=5" in output
+
+
+def test_failed_plan_returns_nonzero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = object()
+    counts = {
+        "new_file": 0,
+        "changed_file": 0,
+        "delete_from_current": 0,
+        "rename_move_candidate": 0,
+        "skipped_recent": 0,
+        "error": 1,
+    }
+    result = PlanResult(
+        "failed-plan", "failed", (), counts, {}, 0, 0, Path("failed-plan.json")
+    )
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "gorbackup.cli.check_rclone",
+        lambda: SimpleNamespace(version=(1, 70, 0)),
+    )
+    monkeypatch.setattr("gorbackup.cli.load_baseline_summary", lambda value: None)
+    monkeypatch.setattr("gorbackup.cli.run_preflight", lambda *args, **kwargs: object())
+    monkeypatch.setattr("gorbackup.cli.create_plan", lambda *args: result)
+
+    assert main(["--config", "unused.yaml", "plan"]) == 2
+    assert "errors=1" in capsys.readouterr().out
