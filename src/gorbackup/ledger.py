@@ -105,6 +105,12 @@ CREATE TABLE IF NOT EXISTS plan_items (
     reason TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS backup_runs (
+    run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+    plan_run_id TEXT NOT NULL REFERENCES plans(run_id),
+    history_path TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_status_completed
     ON runs(status, completed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_file_changes_run_type
@@ -265,6 +271,46 @@ class Ledger:
             (run_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def complete_backup(
+        self,
+        run_id: str,
+        plan_run_id: str,
+        completed_at: str,
+        history_path: str,
+        file_count: int,
+        bytes_copied: int,
+        bytes_archived: int,
+        warnings: Sequence[str],
+    ) -> None:
+        """Atomically publish a successful backup run and its plan linkage."""
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO backup_runs (run_id, plan_run_id, history_path)
+                VALUES (?, ?, ?)
+                """,
+                (run_id, plan_run_id, history_path),
+            )
+            cursor = self.connection.execute(
+                """
+                UPDATE runs SET completed_at = ?, status = 'success',
+                    file_count = ?, total_bytes = ?, bytes_copied = ?,
+                    bytes_archived = ?, warnings_json = ?
+                WHERE run_id = ? AND status = 'running'
+                """,
+                (
+                    completed_at,
+                    file_count,
+                    bytes_copied,
+                    bytes_copied,
+                    bytes_archived,
+                    json.dumps(list(warnings)),
+                    run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LedgerError(f"run is not active: {run_id}")
 
     def stage_files(self, run_id: str, files: Iterable[FileMetadata]) -> None:
         with self.connection:

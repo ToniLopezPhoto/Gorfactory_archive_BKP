@@ -1,9 +1,8 @@
 # gorbackup
 
 `gorbackup` is the command-line entry point for the Gorfactory archive backup
-system. It includes configuration, dependency and preflight checks plus a safe
-workflow for adopting an existing first dump. Scheduled backup operations remain
-placeholders.
+system. It includes configuration, dependency and preflight checks, baseline
+adoption, dry-run planning, and versioned incremental synchronization.
 
 ## Requirements
 
@@ -25,8 +24,8 @@ Edit `config/config.yaml` for the local machine. It is ignored by Git and must
 not be committed. The example paths are illustrative only.
 
 Every operational command validates the configuration and the installed
-`rclone` version. `backup` additionally runs read-only safety checks before
-reporting its placeholder status; it never writes to the source. The configured
+`rclone` version. `backup` additionally runs read-only safety checks and a fresh
+plan before syncing; it never writes to the source. The configured
 identity markers and archive directories must be provisioned by an operator.
 See [docs/configuration.md](docs/configuration.md) for the available settings.
 
@@ -64,11 +63,23 @@ gorbackup --config config/config.yaml plan
 The preview reports transfer and `current/` departure counts/bytes, rename
 candidates, recent files and errors. See [docs/planning.md](docs/planning.md).
 
+To execute the same non-destructive sync shape, preserving every displaced file
+under a unique history directory:
+
+```sh
+gorbackup --config config/config.yaml backup
+```
+
+See [docs/backup.md](docs/backup.md) for execution and recovery semantics.
+
 ## Development
 
 ```sh
 python -m pytest
 ```
+
+Pull requests targeting `main` run compilation and the full suite on every
+supported CPython version through GitHub Actions.
 
 Project directories are organized as follows:
 

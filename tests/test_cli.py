@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from gorbackup.cli import COMMANDS, main
+from gorbackup.backup import BackupResult
 from gorbackup.baseline import BaselineResult, ComparisonReport
 from gorbackup.ledger import ScanResult
 from gorbackup.planner import PlanResult
@@ -11,7 +12,12 @@ from gorbackup.preflight import PreflightError, PreflightResult, SourceSummary
 
 
 @pytest.mark.parametrize(
-    "command", [item for item in COMMANDS if item not in {"baseline", "scan", "plan"}]
+    "command",
+    [
+        item
+        for item in COMMANDS
+        if item not in {"backup", "baseline", "scan", "plan"}
+    ],
 )
 def test_placeholder_commands_validate_without_touching_paths(
     command: str,
@@ -48,10 +54,23 @@ def test_backup_runs_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda: SimpleNamespace(version=(1, 70, 0)),
     )
     monkeypatch.setattr(
-        "gorbackup.cli.run_preflight",
-        lambda value, **kwargs: calls.append(value),
+        "gorbackup.cli.run_preflight", lambda value, **kwargs: calls.append(value)
     )
     monkeypatch.setattr("gorbackup.cli.load_baseline_summary", lambda config: None)
+    monkeypatch.setattr(
+        "gorbackup.cli.run_backup",
+        lambda *args: BackupResult(
+            "backup-1",
+            "plan-1",
+            "success",
+            1,
+            10,
+            1,
+            5,
+            Path("history/backup-1"),
+            Path("backup.json"),
+        ),
+    )
 
     assert main(["--config", "unused.yaml", "backup"]) == 0
     assert calls == [config]
