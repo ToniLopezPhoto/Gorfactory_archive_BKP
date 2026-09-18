@@ -29,6 +29,9 @@ creating, or modifying the paths it contains.
 - `logging.level`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
 - `logging.directory`: local log directory.
 - `logging.keep_days`: number of days of logs to retain.
+- `state.directory`: local directory for generated baseline state and run records.
+- `state.baseline_manifest`: known-good baseline summary filename.
+- `state.baseline_report`: latest path-level comparison report filename.
 
 The implementation never supplies organization-specific source or archive paths.
 Local configuration, logs, state databases, and manifests are excluded by
@@ -36,8 +39,10 @@ Local configuration, logs, state databases, and manifests are excluded by
 
 ## Preflight behavior
 
-Before `backup`, `gorbackup` verifies both mounts and identity markers, source
-readability, archive writability and required directories, separate filesystems,
-free space, and source plausibility. All checks are read-only with respect to the
-source. A failed check prints explicit reasons and returns exit status `2` before
-any backup operation can start.
+Before `backup` or `baseline`, `gorbackup` verifies both mounts and identity
+markers, source readability, archive writability and required directories,
+separate filesystems, free space, and source plausibility. After a baseline has
+been adopted, `backup` also compares the current source count and size with its
+known-good summary. All checks are read-only with respect to the source. A failed
+check prints explicit reasons and returns exit status `2` before any data operation
+can start.

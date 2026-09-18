@@ -4,10 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from gorbackup.cli import COMMANDS, main
-from gorbackup.preflight import PreflightError
+from gorbackup.baseline import BaselineResult, ComparisonReport
+from gorbackup.preflight import PreflightError, PreflightResult, SourceSummary
 
 
-@pytest.mark.parametrize("command", COMMANDS)
+@pytest.mark.parametrize("command", [item for item in COMMANDS if item != "baseline"])
 def test_placeholder_commands_validate_without_touching_paths(
     command: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -18,7 +19,8 @@ def test_placeholder_commands_validate_without_touching_paths(
         "gorbackup.cli.check_rclone",
         lambda: SimpleNamespace(version=(1, 70, 0)),
     )
-    monkeypatch.setattr("gorbackup.cli.run_preflight", lambda config: None)
+    monkeypatch.setattr("gorbackup.cli.run_preflight", lambda config, **kwargs: None)
+    monkeypatch.setattr("gorbackup.cli.load_baseline_summary", lambda config: None)
 
     assert main(["--config", "unused.yaml", command]) == 0
     assert "operation is not implemented yet" in capsys.readouterr().out
@@ -41,7 +43,11 @@ def test_backup_runs_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
         "gorbackup.cli.check_rclone",
         lambda: SimpleNamespace(version=(1, 70, 0)),
     )
-    monkeypatch.setattr("gorbackup.cli.run_preflight", lambda value: calls.append(value))
+    monkeypatch.setattr(
+        "gorbackup.cli.run_preflight",
+        lambda value, **kwargs: calls.append(value),
+    )
+    monkeypatch.setattr("gorbackup.cli.load_baseline_summary", lambda config: None)
 
     assert main(["--config", "unused.yaml", "backup"]) == 0
     assert calls == [config]
@@ -57,8 +63,40 @@ def test_preflight_failure_returns_nonzero(
     )
     monkeypatch.setattr(
         "gorbackup.cli.run_preflight",
-        lambda config: (_ for _ in ()).throw(PreflightError(["wrong archive disk"])),
+        lambda config, **kwargs: (_ for _ in ()).throw(
+            PreflightError(["wrong archive disk"])
+        ),
     )
+    monkeypatch.setattr("gorbackup.cli.load_baseline_summary", lambda config: None)
 
     assert main(["--config", "unused.yaml", "backup"]) == 2
     assert "wrong archive disk" in capsys.readouterr().err
+
+
+def test_baseline_command_adopts_verified_dump(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = object()
+    rclone = SimpleNamespace(version=(1, 70, 0))
+    preflight = PreflightResult(SourceSummary(1, 10), 80.0)
+    comparison = ComparisonReport(1, (), (), (), ())
+    expected = BaselineResult(
+        Path("state/baseline.json"),
+        Path("state/baseline-report.json"),
+        comparison,
+        False,
+    )
+    calls = []
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
+    monkeypatch.setattr("gorbackup.cli.check_rclone", lambda: rclone)
+    monkeypatch.setattr(
+        "gorbackup.cli.run_preflight", lambda value, **kwargs: preflight
+    )
+    monkeypatch.setattr(
+        "gorbackup.cli.adopt_baseline",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or expected,
+    )
+
+    assert main(["--config", "unused.yaml", "baseline"]) == 0
+    assert calls[0][0] == (config, rclone, preflight)
+    assert "verified and adopted" in capsys.readouterr().out

@@ -26,3 +26,8 @@ logging:
   level: INFO
   directory: logs
   keep_days: 30
+
+state:
+  directory: state
+  baseline_manifest: baseline.json
+  baseline_report: baseline-report.json

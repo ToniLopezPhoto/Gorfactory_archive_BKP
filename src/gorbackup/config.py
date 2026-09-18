@@ -51,12 +51,20 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class StateConfig:
+    directory: Path = Path("state")
+    baseline_manifest: str = "baseline.json"
+    baseline_report: str = "baseline-report.json"
+
+
+@dataclass(frozen=True)
 class AppConfig:
     source: SourceConfig
     archive: ArchiveConfig
     safety: SafetyConfig
     retention: RetentionConfig
     logging: LoggingConfig
+    state: StateConfig = StateConfig()
 
 
 def _section(data: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -103,6 +111,9 @@ def load_config(path: Path) -> AppConfig:
     logging = raw.get("logging", {})
     if not isinstance(logging, Mapping):
         raise ConfigError("'logging' must be a mapping")
+    state = raw.get("state", {})
+    if not isinstance(state, Mapping):
+        raise ConfigError("'state' must be a mapping")
 
     source_path = _required(source, "source", "path")
     source_mount = _required(source, "source", "mount_path")
@@ -170,6 +181,23 @@ def load_config(path: Path) -> AppConfig:
     if isinstance(keep_days, bool) or not isinstance(keep_days, int) or keep_days < 0:
         raise ConfigError("'logging.keep_days' must be a non-negative integer")
 
+    state_directory = state.get("directory", "state")
+    baseline_manifest = state.get("baseline_manifest", "baseline.json")
+    baseline_report = state.get("baseline_report", "baseline-report.json")
+    for name, value in (
+        ("state.directory", state_directory),
+        ("state.baseline_manifest", baseline_manifest),
+        ("state.baseline_report", baseline_report),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"'{name}' must be a non-empty string")
+    for name, value in (
+        ("state.baseline_manifest", baseline_manifest),
+        ("state.baseline_report", baseline_report),
+    ):
+        if Path(value).name != value:
+            raise ConfigError(f"'{name}' must be a filename, not a path")
+
     return AppConfig(
         source=SourceConfig(
             Path(source_path), Path(source_mount), source_marker, source_marker_id
@@ -199,4 +227,7 @@ def load_config(path: Path) -> AppConfig:
         ),
         retention=RetentionConfig(auto_prune=auto_prune),
         logging=LoggingConfig(level.upper(), Path(directory), keep_days),
+        state=StateConfig(
+            Path(state_directory), baseline_manifest, baseline_report
+        ),
     )
