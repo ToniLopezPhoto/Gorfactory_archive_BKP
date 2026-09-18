@@ -13,6 +13,7 @@ from gorbackup.dependencies import DependencyError, check_rclone
 from gorbackup.ledger import LedgerError, scan_catalogue
 from gorbackup.planner import PlanError, create_plan
 from gorbackup.preflight import PreflightError, run_preflight
+from gorbackup.safety import SafetyError
 
 COMMANDS = (
     "backup",
@@ -109,6 +110,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LedgerError,
         PlanError,
         BackupError,
+        SafetyError,
     ) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
@@ -130,6 +132,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"transferred_bytes={backup_result.transferred_bytes}; "
             f"archived_files={backup_result.archived_files}; "
             f"archived_bytes={backup_result.archived_bytes}; "
+            f"delete_count={backup_result.safety.delete_count}; "
+            f"delete_bytes={backup_result.safety.delete_bytes}; "
+            f"projected_free_percent="
+            f"{backup_result.safety.free_percent_after:.1f}; "
             f"history={backup_result.history_path}; "
             f"manifest={backup_result.manifest_path}"
         )

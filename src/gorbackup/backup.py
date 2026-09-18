@@ -13,6 +13,7 @@ from gorbackup.config import AppConfig
 from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import Ledger, validate_state_location
 from gorbackup.planner import PlanResult, _atomic_json, create_plan, parse_json_log
+from gorbackup.safety import SafetyAssessment, assess_plan_safety
 
 
 class BackupError(RuntimeError):
@@ -28,6 +29,7 @@ class BackupResult:
     transferred_bytes: int
     archived_files: int
     archived_bytes: int
+    safety: SafetyAssessment
     history_path: Path
     manifest_path: Path
 
@@ -44,12 +46,14 @@ def run_backup(
     now: Callable[[], datetime] = _utc_now,
     run_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     planner: Callable[..., PlanResult] = create_plan,
+    safety_checker: Callable[..., SafetyAssessment] = assess_plan_safety,
 ) -> BackupResult:
     """Plan and execute one sync, preserving displaced files by run ID."""
     validate_state_location(config)
     plan = planner(config, rclone, runner=runner, now=now)
     if plan.status != "success":
         raise BackupError(f"refusing to execute failed plan: {plan.run_id}")
+    safety = safety_checker(config, plan)
 
     run_id = run_id_factory()
     started_at = now()
@@ -80,6 +84,10 @@ def run_backup(
         str(log_path),
         "--backup-dir",
         str(history_path),
+        "--max-delete",
+        str(config.safety.max_deletes_per_run),
+        "--max-delete-size",
+        f"{int(config.safety.max_delete_size_gb * 1024 ** 3)}B",
         "--exclude",
         f"/{config.source.marker_file}",
         "--retries",
@@ -152,6 +160,7 @@ def run_backup(
         "archived_files": archived_files,
         "archived_bytes": plan.leaving_current_bytes,
         "warnings": warnings,
+        "safety": asdict(safety),
         "plan": [asdict(item) for item in plan.items],
     }
     try:
@@ -169,6 +178,7 @@ def run_backup(
         plan.transfer_bytes,
         archived_files,
         plan.leaving_current_bytes,
+        safety,
         history_path,
         manifest_path,
     )
