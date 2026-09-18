@@ -8,6 +8,7 @@ from typing import Optional, Sequence
 from gorbackup import __version__
 from gorbackup.config import ConfigError, load_config
 from gorbackup.dependencies import DependencyError, check_rclone
+from gorbackup.preflight import PreflightError, run_preflight
 
 COMMANDS = ("backup", "plan", "status", "verify", "restore", "audit")
 
@@ -38,9 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        load_config(args.config)
+        config = load_config(args.config)
         rclone = check_rclone()
-    except (ConfigError, DependencyError) as exc:
+        if args.command == "backup":
+            run_preflight(config)
+    except (ConfigError, DependencyError, PreflightError) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
 

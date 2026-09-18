@@ -25,9 +25,10 @@ Edit `config/config.yaml` for the local machine. It is ignored by Git and must
 not be committed. The example paths are illustrative only.
 
 Every operational command validates the configuration and the installed
-`rclone` version before reporting its placeholder status. It does not touch the
-source or destination. See [docs/configuration.md](docs/configuration.md) for
-the available settings.
+`rclone` version. `backup` additionally runs read-only safety checks before
+reporting its placeholder status; it never writes to the source. The configured
+identity markers and archive directories must be provisioned by an operator.
+See [docs/configuration.md](docs/configuration.md) for the available settings.
 
 ## Development
 

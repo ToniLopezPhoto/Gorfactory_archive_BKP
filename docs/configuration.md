@@ -7,12 +7,23 @@ creating, or modifying the paths it contains.
 ## Sections
 
 - `source.path`: source directory to archive.
-- `archive.root`: destination root. `current_dir` and `history_dir` are directory
-  names below that root.
+- `source.mount_path`: mount point of the SAM volume containing `source.path`.
+- `source.marker_file` and `source.marker_id`: marker filename at `source.path`
+  and its exact expected text. The marker must be provisioned by an operator;
+  `gorbackup` only reads it.
+- `archive.root`: mounted destination root. `current_dir` and `history_dir` are
+  required directory names below that root.
+- `archive.marker_file` and `archive.marker_id`: separate marker filename at the
+  archive root and its exact expected text.
 - `safety.max_deletes_per_run`: maximum number of deletions allowed in one run.
 - `safety.max_delete_size_gb`: maximum combined deletion size in GiB.
 - `safety.min_free_space_percent`: required free space from 0 through 100.
 - `safety.ignore_recent_minutes`: age below which source changes are ignored.
+- `safety.min_source_size_gb`: absolute minimum source size in GiB. This catches
+  an empty or implausibly small source before a baseline manifest is available.
+- `safety.min_source_size_ratio`: minimum fraction (greater than 0 through 1) of both the file
+  count and byte size in the last known-good manifest. The manifest integration
+  can pass that baseline to the preflight checks without changing their logic.
 - `retention.auto_prune`: whether future retention logic may remove old history;
   disabled in the example.
 - `logging.level`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
@@ -22,3 +33,11 @@ creating, or modifying the paths it contains.
 The implementation never supplies organization-specific source or archive paths.
 Local configuration, logs, state databases, and manifests are excluded by
 `.gitignore`.
+
+## Preflight behavior
+
+Before `backup`, `gorbackup` verifies both mounts and identity markers, source
+readability, archive writability and required directories, separate filesystems,
+free space, and source plausibility. All checks are read-only with respect to the
+source. A failed check prints explicit reasons and returns exit status `2` before
+any backup operation can start.
