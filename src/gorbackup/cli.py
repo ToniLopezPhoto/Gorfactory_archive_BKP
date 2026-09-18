@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from gorbackup import __version__
+from gorbackup.baseline import BaselineError, adopt_baseline, load_baseline_summary
 from gorbackup.config import ConfigError, load_config
 from gorbackup.dependencies import DependencyError, check_rclone
 from gorbackup.preflight import PreflightError, run_preflight
 
-COMMANDS = ("backup", "plan", "status", "verify", "restore", "audit")
+COMMANDS = ("backup", "baseline", "plan", "status", "verify", "restore", "audit")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,11 +29,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in COMMANDS:
-        subparsers.add_parser(
+        subparser = subparsers.add_parser(
             command,
-            help=f"{command} operation (placeholder)",
-            description=f"Validate prerequisites for the future {command} operation.",
+            help=(
+                "verify and adopt an existing first dump"
+                if command == "baseline"
+                else f"{command} operation (placeholder)"
+            ),
+            description=(
+                "Verify an existing archive copy and record a trusted baseline."
+                if command == "baseline"
+                else f"Validate prerequisites for the future {command} operation."
+            ),
         )
+        if command == "baseline":
+            subparser.add_argument(
+                "--reconcile",
+                action="store_true",
+                help="copy missing or mismatched files, without deleting destination extras",
+            )
     return parser
 
 
@@ -41,11 +56,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         config = load_config(args.config)
         rclone = check_rclone()
-        if args.command == "backup":
-            run_preflight(config)
-    except (ConfigError, DependencyError, PreflightError) as exc:
+        preflight = None
+        if args.command in {"backup", "baseline"}:
+            baseline = load_baseline_summary(config) if args.command == "backup" else None
+            preflight = run_preflight(config, baseline=baseline)
+        if args.command == "baseline":
+            result = adopt_baseline(
+                config,
+                rclone,
+                preflight,
+                reconcile=args.reconcile,
+            )
+    except (ConfigError, DependencyError, PreflightError, BaselineError) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
+
+    if args.command == "baseline":
+        extras = len(result.comparison.destination_extras)
+        action = "reconciled and adopted" if result.reconciled else "verified and adopted"
+        print(
+            f"baseline: {action}; manifest={result.manifest_path}; "
+            f"destination_extras={extras}"
+        )
+        return 0
 
     version = ".".join(str(part) for part in rclone.version)
     print(

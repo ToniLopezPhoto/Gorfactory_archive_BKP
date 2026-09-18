@@ -1,9 +1,9 @@
 # gorbackup
 
 `gorbackup` is the command-line entry point for the Gorfactory archive backup
-system. This initial version establishes configuration and dependency checks;
-backup operations are deliberately placeholders and do not read or write the
-configured source or archive.
+system. It includes configuration, dependency and preflight checks plus a safe
+workflow for adopting an existing first dump. Scheduled backup operations remain
+placeholders.
 
 ## Requirements
 
@@ -29,6 +29,22 @@ Every operational command validates the configuration and the installed
 reporting its placeholder status; it never writes to the source. The configured
 identity markers and archive directories must be provisioned by an operator.
 See [docs/configuration.md](docs/configuration.md) for the available settings.
+
+To verify the existing dump without changing either side:
+
+```sh
+gorbackup --config config/config.yaml baseline
+```
+
+If the report identifies missing or mismatched destination files, reconciliation
+must be requested explicitly. It uses `rclone copy`, never deletes destination
+extras, and verifies again before writing the baseline manifest:
+
+```sh
+gorbackup --config config/config.yaml baseline --reconcile
+```
+
+See [docs/baseline.md](docs/baseline.md) for the adoption workflow.
 
 ## Development
 

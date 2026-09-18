@@ -40,6 +40,7 @@ def test_load_config_does_not_require_configured_paths(tmp_path: Path) -> None:
     assert config.archive.root == Path("/archive")
     assert config.safety.max_delete_size_gb == 2.5
     assert config.retention.auto_prune is False
+    assert config.state.baseline_manifest == "baseline.json"
 
 
 def test_invalid_source_ratio_is_rejected(tmp_path: Path) -> None:
