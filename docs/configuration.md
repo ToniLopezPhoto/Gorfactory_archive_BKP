@@ -29,7 +29,10 @@ creating, or modifying the paths it contains.
 - `logging.level`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
 - `logging.directory`: local log directory.
 - `logging.keep_days`: number of days of logs to retain.
-- `state.directory`: local directory for generated baseline state and run records.
+- `state.directory`: state directory below `archive.root`. Absolute paths are
+  accepted only when they still resolve inside the archive root.
+- `state.manifests_dir`: human-readable manifest summary directory below state.
+- `state.ledger_file`: SQLite current-state and run-history filename.
 - `state.baseline_manifest`: known-good baseline summary filename.
 - `state.baseline_report`: latest path-level comparison report filename.
 

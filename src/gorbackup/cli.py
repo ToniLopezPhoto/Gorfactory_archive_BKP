@@ -9,9 +9,19 @@ from gorbackup import __version__
 from gorbackup.baseline import BaselineError, adopt_baseline, load_baseline_summary
 from gorbackup.config import ConfigError, load_config
 from gorbackup.dependencies import DependencyError, check_rclone
+from gorbackup.ledger import LedgerError, scan_catalogue
 from gorbackup.preflight import PreflightError, run_preflight
 
-COMMANDS = ("backup", "baseline", "plan", "status", "verify", "restore", "audit")
+COMMANDS = (
+    "backup",
+    "baseline",
+    "scan",
+    "plan",
+    "status",
+    "verify",
+    "restore",
+    "audit",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,11 +44,15 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "verify and adopt an existing first dump"
                 if command == "baseline"
+                else "inventory catalogue metadata"
+                if command == "scan"
                 else f"{command} operation (placeholder)"
             ),
             description=(
                 "Verify an existing archive copy and record a trusted baseline."
                 if command == "baseline"
+                else "Scan source metadata and update the SQLite inventory."
+                if command == "scan"
                 else f"Validate prerequisites for the future {command} operation."
             ),
         )
@@ -57,8 +71,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config = load_config(args.config)
         rclone = check_rclone()
         preflight = None
-        if args.command in {"backup", "baseline"}:
-            baseline = load_baseline_summary(config) if args.command == "backup" else None
+        if args.command in {"backup", "baseline", "scan"}:
+            baseline = (
+                load_baseline_summary(config)
+                if args.command in {"backup", "scan"}
+                else None
+            )
             preflight = run_preflight(config, baseline=baseline)
         if args.command == "baseline":
             result = adopt_baseline(
@@ -67,7 +85,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 preflight,
                 reconcile=args.reconcile,
             )
-    except (ConfigError, DependencyError, PreflightError, BaselineError) as exc:
+        if args.command == "scan":
+            scan_result = scan_catalogue(config)
+    except (
+        ConfigError,
+        DependencyError,
+        PreflightError,
+        BaselineError,
+        LedgerError,
+    ) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
 
@@ -77,6 +103,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             f"baseline: {action}; manifest={result.manifest_path}; "
             f"destination_extras={extras}"
+        )
+        return 0
+
+    if args.command == "scan":
+        print(
+            f"scan: success; run_id={scan_result.run_id}; "
+            f"files={scan_result.file_count}; bytes={scan_result.total_bytes}; "
+            f"changed={scan_result.changed_files}; deleted={scan_result.deleted_paths}"
         )
         return 0
 

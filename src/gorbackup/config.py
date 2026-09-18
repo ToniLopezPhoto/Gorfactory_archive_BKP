@@ -53,6 +53,8 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class StateConfig:
     directory: Path = Path("state")
+    manifests_dir: str = "manifests"
+    ledger_file: str = "gorbackup.sqlite3"
     baseline_manifest: str = "baseline.json"
     baseline_report: str = "baseline-report.json"
 
@@ -65,6 +67,21 @@ class AppConfig:
     retention: RetentionConfig
     logging: LoggingConfig
     state: StateConfig = StateConfig()
+
+    @property
+    def state_root(self) -> Path:
+        """Return the state root, resolving relative paths below the archive."""
+        if self.state.directory.is_absolute():
+            return self.state.directory
+        return self.archive.root / self.state.directory
+
+    @property
+    def manifests_root(self) -> Path:
+        return self.state_root / self.state.manifests_dir
+
+    @property
+    def ledger_path(self) -> Path:
+        return self.state_root / self.state.ledger_file
 
 
 def _section(data: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -182,16 +199,22 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("'logging.keep_days' must be a non-negative integer")
 
     state_directory = state.get("directory", "state")
+    manifests_dir = state.get("manifests_dir", "manifests")
+    ledger_file = state.get("ledger_file", "gorbackup.sqlite3")
     baseline_manifest = state.get("baseline_manifest", "baseline.json")
     baseline_report = state.get("baseline_report", "baseline-report.json")
     for name, value in (
         ("state.directory", state_directory),
+        ("state.manifests_dir", manifests_dir),
+        ("state.ledger_file", ledger_file),
         ("state.baseline_manifest", baseline_manifest),
         ("state.baseline_report", baseline_report),
     ):
         if not isinstance(value, str) or not value.strip():
             raise ConfigError(f"'{name}' must be a non-empty string")
     for name, value in (
+        ("state.manifests_dir", manifests_dir),
+        ("state.ledger_file", ledger_file),
         ("state.baseline_manifest", baseline_manifest),
         ("state.baseline_report", baseline_report),
     ):
@@ -228,6 +251,10 @@ def load_config(path: Path) -> AppConfig:
         retention=RetentionConfig(auto_prune=auto_prune),
         logging=LoggingConfig(level.upper(), Path(directory), keep_days),
         state=StateConfig(
-            Path(state_directory), baseline_manifest, baseline_report
+            Path(state_directory),
+            manifests_dir,
+            ledger_file,
+            baseline_manifest,
+            baseline_report,
         ),
     )

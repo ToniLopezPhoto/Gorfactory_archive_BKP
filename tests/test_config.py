@@ -41,6 +41,9 @@ def test_load_config_does_not_require_configured_paths(tmp_path: Path) -> None:
     assert config.safety.max_delete_size_gb == 2.5
     assert config.retention.auto_prune is False
     assert config.state.baseline_manifest == "baseline.json"
+    assert config.state.ledger_file == "gorbackup.sqlite3"
+    assert config.state_root == Path("/archive/state")
+    assert config.manifests_root == Path("/archive/state/manifests")
 
 
 def test_invalid_source_ratio_is_rejected(tmp_path: Path) -> None:

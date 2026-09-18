@@ -5,10 +5,13 @@ import pytest
 
 from gorbackup.cli import COMMANDS, main
 from gorbackup.baseline import BaselineResult, ComparisonReport
+from gorbackup.ledger import ScanResult
 from gorbackup.preflight import PreflightError, PreflightResult, SourceSummary
 
 
-@pytest.mark.parametrize("command", [item for item in COMMANDS if item != "baseline"])
+@pytest.mark.parametrize(
+    "command", [item for item in COMMANDS if item not in {"baseline", "scan"}]
+)
 def test_placeholder_commands_validate_without_touching_paths(
     command: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -100,3 +103,21 @@ def test_baseline_command_adopts_verified_dump(
     assert main(["--config", "unused.yaml", "baseline"]) == 0
     assert calls[0][0] == (config, rclone, preflight)
     assert "verified and adopted" in capsys.readouterr().out
+
+
+def test_scan_command_updates_inventory(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = object()
+    result = ScanResult("run-1", "success", 2, 30, 1, 0, (), Path("summary.json"))
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "gorbackup.cli.check_rclone",
+        lambda: SimpleNamespace(version=(1, 70, 0)),
+    )
+    monkeypatch.setattr("gorbackup.cli.load_baseline_summary", lambda value: None)
+    monkeypatch.setattr("gorbackup.cli.run_preflight", lambda *args, **kwargs: object())
+    monkeypatch.setattr("gorbackup.cli.scan_catalogue", lambda value: result)
+
+    assert main(["--config", "unused.yaml", "scan"]) == 0
+    assert "run_id=run-1" in capsys.readouterr().out

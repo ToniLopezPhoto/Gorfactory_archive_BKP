@@ -50,6 +50,7 @@ Only a successful final comparison writes the known-good manifest. It records:
 - whether reconciliation was required;
 - timestamps and a separate baseline run record.
 
-State files are written atomically below `state.directory` and are ignored by Git.
-Future backup preflights load the manifest summary and abort if the source becomes
+State files are written atomically below
+`archive.root/state.directory/state.manifests_dir` and are ignored by Git. Future
+backup preflights load the manifest summary and abort if the source becomes
 implausibly smaller than this baseline.
