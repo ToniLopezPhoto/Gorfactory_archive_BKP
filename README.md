@@ -82,6 +82,9 @@ python -m pytest
 Pull requests targeting `main` run compilation and the full suite on every
 supported CPython version through GitHub Actions.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the required branch, PR, test, and
+issue-closing workflow. `main` is the sole integration branch.
+
 Project directories are organized as follows:
 
 - `src/gorbackup/`: application package and CLI
