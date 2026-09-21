@@ -22,8 +22,16 @@ creating, or modifying the paths it contains.
 - `safety.min_source_size_gb`: absolute minimum source size in GiB. This catches
   an empty or implausibly small source before a baseline manifest is available.
 - `safety.min_source_size_ratio`: minimum fraction (greater than 0 through 1) of both the file
-  count and byte size in the last known-good manifest. The manifest integration
-  can pass that baseline to the preflight checks without changing their logic.
+  count and byte size used by baseline-aware scan/plan preflight.
+- `safety.max_source_file_count_drop` and
+  `safety.max_source_file_count_drop_percent`: absolute and percentage limits for
+  file-count shrink against latest known-good (or initial baseline as fallback).
+- `safety.max_source_bytes_drop_gb` and
+  `safety.max_source_bytes_drop_percent`: equivalent source byte-shrink limits.
+- `safety.max_changed_files_per_run`: maximum planned new, modified, or moved files.
+- `safety.max_changed_bytes_gb`: maximum bytes in those planned changes.
+- `safety.max_changed_catalogue_percent`: maximum changed-file proportion relative
+  to the reference catalogue.
 - `retention.auto_prune`: whether future retention logic may remove old history;
   disabled in the example.
 - `logging.level`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
@@ -44,8 +52,9 @@ Local configuration, logs, state databases, and manifests are excluded by
 
 Before `backup` or `baseline`, `gorbackup` verifies both mounts and identity
 markers, source readability, archive writability and required directories,
-separate filesystems, free space, and source plausibility. After a baseline has
-been adopted, `backup` also compares the current source count and size with its
-known-good summary. All checks are read-only with respect to the source. A failed
-check prints explicit reasons and returns exit status `2` before any data operation
-can start.
+separate filesystems, free space, and absolute source plausibility. After the
+immutable backup plan exists, safety compares its catalogue totals primarily with
+the ledger's latest known-good state and uses the adopted baseline only if no
+successful backup has yet been promoted. All checks are read-only with respect to
+the source. Critical preflight failures stop before planning; safety-gate failures
+are recorded as blocked attempts before any data operation can start.

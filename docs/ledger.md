@@ -19,7 +19,7 @@ uses `executed_transfer_files/bytes` and `executed_archive_files/bytes`.
 
 There is no generic `file_count` or `total_bytes`: those names previously mixed
 inventory, intent, and outcome. Path evidence is retained in `plan_items`,
-`execution_items`, and `reconciliation_items`.
+`safety_assessments`, `execution_items`, and `reconciliation_items`.
 
 ## Transaction and publication rules
 
@@ -30,13 +30,15 @@ scan leaves the previous catalogue snapshot intact.
 A plan stores its own complete catalogue snapshot and operation list. The real
 run writes a separate `execution-<run-id>.json`; dry-run output is never reused
 as execution evidence. Only an execution with status `success` and reconciliation
-`exact` can replace `known_good_files` and `known_good_state`. `warning`, `failed`,
-incomplete (`running`), or unparseable runs retain their evidence but cannot
-advance known-good state.
+`exact` can replace `known_good_files` and `known_good_state`. `blocked`,
+`warning`, `failed`, incomplete (`running`), or unparseable runs retain their
+evidence but cannot advance known-good state. A blocked run points to its immutable
+plan and stores the complete original assessment, failed gates, override request,
+override decision, measured values, thresholds, and human-readable message.
 
 ## Schema migration
 
-Schema v2 is deliberately clean because the project is pre-production. Opening
-a v1 database atomically removes its ambiguous run/inventory tables and creates
-the v2 schema with `PRAGMA user_version = 2`. The next scan/plan rebuilds state;
-no v1 `total_bytes` value is guessed into a new semantic field.
+Schema v3 adds blocked runs and safety assessments. Because the project remains
+pre-production, opening a v1 or v2 database atomically replaces its state tables
+with the v3 schema (`PRAGMA user_version = 3`). The next scan/plan rebuilds state;
+no ambiguous legacy metric is guessed into a new semantic field.

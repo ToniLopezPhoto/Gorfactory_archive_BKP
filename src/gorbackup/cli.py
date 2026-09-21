@@ -73,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="copy missing or mismatched files, without deleting destination extras",
             )
+        if command == "backup":
+            subparser.add_argument(
+                "--override-safety",
+                action="store_true",
+                help="manually accept overridable volume anomalies (interactive terminal only)",
+            )
     return parser
 
 
@@ -85,7 +91,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command in {"backup", "baseline", "scan", "plan"}:
             baseline = (
                 load_baseline_summary(config)
-                if args.command in {"backup", "scan", "plan"}
+                if args.command in {"scan", "plan"}
                 else None
             )
             preflight = run_preflight(config, baseline=baseline)
@@ -97,7 +103,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 reconcile=args.reconcile,
             )
         if args.command == "backup":
-            backup_result = run_backup(config, rclone)
+            manual_context = bool(sys.stdin.isatty() and sys.stdout.isatty())
+            if args.override_safety and not manual_context:
+                raise BackupError(
+                    "--override-safety is manual-only and requires an interactive terminal"
+                )
+            backup_result = run_backup(
+                config, rclone, override_safety=args.override_safety,
+                manual_context=manual_context,
+            )
         if args.command == "scan":
             scan_result = scan_catalogue(config)
         if args.command == "plan":

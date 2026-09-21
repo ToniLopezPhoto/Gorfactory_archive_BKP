@@ -25,10 +25,18 @@ from gorbackup.config import (
 from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import FileMetadata, Ledger
 from gorbackup.planner import PlanItem, PlanResult
-from gorbackup.safety import SafetyAssessment, SafetyError
+from gorbackup.safety import GateFailure, SafetyAssessment, SafetyError
 
 FIXED_TIME = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
 APPROVED = SafetyAssessment(1, 5, 10, 100, 90, 90.0)
+
+
+def rejected_assessment() -> SafetyAssessment:
+    failure = GateFailure(
+        "high_change_count", 5000, 2000, "files",
+        "planned changed files exceed safety.max_changed_files_per_run", True,
+    )
+    return SafetyAssessment(1, 5, 10, 100, 90, 90.0, failures=(failure,))
 
 
 def make_config(tmp_path: Path) -> AppConfig:
@@ -128,7 +136,7 @@ def test_backup_executes_sync_with_unique_versioned_history(tmp_path: Path) -> N
         now=lambda: FIXED_TIME,
         run_id_factory=lambda: "backup-1",
         planner=lambda *args, **kwargs: successful_plan(config),
-        safety_checker=lambda *args: APPROVED,
+        safety_checker=lambda *args, **kwargs: APPROVED,
     )
 
     command = commands[0]
@@ -174,7 +182,7 @@ def test_backup_failure_is_recorded_and_has_no_success_manifest(tmp_path: Path) 
             now=lambda: FIXED_TIME,
             run_id_factory=lambda: "backup-failed",
             planner=lambda *args, **kwargs: successful_plan(config),
-            safety_checker=lambda *args: APPROVED,
+            safety_checker=lambda *args, **kwargs: APPROVED,
         )
 
     assert not (config.manifests_root / "backup-backup-failed.json").exists()
@@ -189,6 +197,7 @@ def test_backup_failure_is_recorded_and_has_no_success_manifest(tmp_path: Path) 
 
 def test_backup_refuses_to_reuse_history_directory(tmp_path: Path) -> None:
     config = make_config(tmp_path)
+    seed_plan(config)
     (config.archive.root / "history" / "duplicate").mkdir()
 
     with pytest.raises(BackupError, match="history target already exists"):
@@ -197,14 +206,15 @@ def test_backup_refuses_to_reuse_history_directory(tmp_path: Path) -> None:
             RcloneInfo("rclone", (1, 70, 0)),
             run_id_factory=lambda: "duplicate",
             planner=lambda *args, **kwargs: successful_plan(config),
-            safety_checker=lambda *args: APPROVED,
+            safety_checker=lambda *args, **kwargs: APPROVED,
         )
 
 
 def test_safety_rejection_blocks_execution_and_history_reservation(tmp_path: Path) -> None:
     config = make_config(tmp_path)
+    seed_plan(config)
 
-    def reject(*args):
+    def reject(*args, **kwargs):
         raise SafetyError(["planned deletions exceed limit"])
 
     def unexpected_runner(*args, **kwargs):
@@ -221,7 +231,13 @@ def test_safety_rejection_blocks_execution_and_history_reservation(tmp_path: Pat
         )
 
     assert not (config.archive.root / "history" / "blocked").exists()
-    assert not config.ledger_path.exists()
+    with Ledger(config.ledger_path) as ledger:
+        run = next(item for item in ledger.run_history() if item["run_id"] == "blocked")
+        assert run["status"] == "blocked"
+        assessment = ledger.safety_assessment("blocked")
+        assert assessment is not None
+        assert "planned deletions exceed limit" in assessment["message"]
+        assert ledger.known_good_state() is None
 
 
 def test_execution_log_is_machine_readable_and_rejects_ambiguous_events() -> None:
@@ -310,9 +326,163 @@ def test_warning_run_does_not_advance_known_good_state(tmp_path: Path) -> None:
         config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
         now=lambda: FIXED_TIME, run_id_factory=lambda: "warning-run",
         planner=lambda *args, **kwargs: successful_plan(config),
-        safety_checker=lambda *args: APPROVED,
+        safety_checker=lambda *args, **kwargs: APPROVED,
     )
 
     assert result.status == "warning"
     with Ledger(config.ledger_path) as ledger:
         assert ledger.known_good_state() is None
+
+
+def test_manual_override_is_audited_and_allows_only_volume_gate(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    seed_plan(config)
+
+    def reject(*args, **kwargs):
+        assessment = rejected_assessment()
+        raise SafetyError([assessment.failures[0].message], assessment)
+
+    def runner(command, **kwargs):
+        history = Path(command[command.index("--backup-dir") + 1])
+        (history / "changed.tif").write_bytes(b"old!")
+        (history / "old.tif").write_bytes(b"older")
+        Path(command[command.index("--log-file") + 1]).write_text(
+            '{"level":"info","msg":"Copied (new)","object":"new.tif","size":3}\n'
+            '{"level":"info","msg":"Moved","object":"changed.tif","size":4}\n'
+            '{"level":"info","msg":"Copied (replaced)","object":"changed.tif","size":7}\n'
+            '{"level":"info","msg":"Moved","object":"old.tif","size":5}\n',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = run_backup(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "overridden",
+        planner=lambda *args, **kwargs: successful_plan(config),
+        safety_checker=reject, override_safety=True, manual_context=True,
+    )
+
+    assert result.status == "success"
+    with Ledger(config.ledger_path) as ledger:
+        audit = ledger.safety_assessment("overridden")
+        assert audit["override_requested"] == 1
+        assert audit["override_used"] == 1
+        assert json.loads(audit["failed_gates_json"]) == ["high_change_count"]
+        assert json.loads(audit["overridden_gates_json"]) == ["high_change_count"]
+
+
+def test_override_is_impossible_without_manual_context(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    with pytest.raises(BackupError, match="interactive manual session"):
+        run_backup(
+            config, RcloneInfo("rclone", (1, 70, 0)),
+            override_safety=True, manual_context=False,
+            planner=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("planning must not start")
+            ),
+        )
+
+
+def test_non_overridable_capacity_gate_stays_blocked(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    seed_plan(config)
+    failure = GateFailure("archive_capacity", 10, 5, "bytes", "insufficient space", False)
+    assessment = SafetyAssessment(0, 0, 10, 5, -5, -1.0, failures=(failure,))
+
+    def reject(*args, **kwargs):
+        raise SafetyError([failure.message], assessment)
+
+    with pytest.raises(SafetyError, match="insufficient space"):
+        run_backup(
+            config, RcloneInfo("rclone", (1, 70, 0)),
+            run_id_factory=lambda: "capacity-blocked",
+            planner=lambda *args, **kwargs: successful_plan(config),
+            safety_checker=reject, override_safety=True, manual_context=True,
+        )
+    with Ledger(config.ledger_path) as ledger:
+        assert ledger.safety_assessment("capacity-blocked")["override_used"] == 0
+        run = next(r for r in ledger.run_history() if r["run_id"] == "capacity-blocked")
+        assert run["status"] == "blocked"
+
+
+def test_successful_run_after_blocked_run_promotes_known_good(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    seed_plan(config)
+    assessment = rejected_assessment()
+
+    with pytest.raises(SafetyError):
+        run_backup(
+            config, RcloneInfo("rclone", (1, 70, 0)),
+            run_id_factory=lambda: "first-blocked",
+            planner=lambda *args, **kwargs: successful_plan(config),
+            safety_checker=lambda *args, **kwargs: (_ for _ in ()).throw(
+                SafetyError([assessment.failures[0].message], assessment)
+            ),
+        )
+
+    def runner(command, **kwargs):
+        history = Path(command[command.index("--backup-dir") + 1])
+        (history / "changed.tif").write_bytes(b"old!")
+        (history / "old.tif").write_bytes(b"older")
+        Path(command[command.index("--log-file") + 1]).write_text(
+            '{"level":"info","msg":"Copied (new)","object":"new.tif","size":3}\n'
+            '{"level":"info","msg":"Moved","object":"changed.tif","size":4}\n'
+            '{"level":"info","msg":"Copied (replaced)","object":"changed.tif","size":7}\n'
+            '{"level":"info","msg":"Moved","object":"old.tif","size":5}\n',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = run_backup(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "then-success",
+        planner=lambda *args, **kwargs: successful_plan(config),
+        safety_checker=lambda *args, **kwargs: APPROVED,
+    )
+    assert result.status == "success"
+    with Ledger(config.ledger_path) as ledger:
+        assert ledger.known_good_state()["run_id"] == "then-success"
+        statuses = {row["run_id"]: row["status"] for row in ledger.run_history()}
+        assert statuses["first-blocked"] == "blocked"
+
+
+@pytest.mark.parametrize("with_known_good", [False, True])
+def test_safety_reference_prefers_known_good_then_baseline(
+    tmp_path: Path, with_known_good: bool
+) -> None:
+    config = make_config(tmp_path)
+    seed_plan(config)
+    config.manifests_root.mkdir(parents=True, exist_ok=True)
+    (config.manifests_root / config.state.baseline_manifest).write_text(
+        json.dumps({
+            "status": "known-good",
+            "source": {"file_count": 99, "total_size_bytes": 999},
+        }),
+        encoding="utf-8",
+    )
+    if with_known_good:
+        with Ledger(config.ledger_path) as ledger, ledger.connection:
+            ledger.connection.execute(
+                """INSERT INTO known_good_state
+                   (singleton, run_id, catalogue_file_count,
+                    catalogue_total_bytes, promoted_at)
+                   VALUES (1, 'plan-1', 3, 15, ?)""",
+                (FIXED_TIME.isoformat(),),
+            )
+    seen = []
+    assessment = rejected_assessment()
+
+    def reject(*args, **kwargs):
+        seen.append(kwargs["reference"])
+        raise SafetyError([assessment.failures[0].message], assessment)
+
+    with pytest.raises(SafetyError):
+        run_backup(
+            config, RcloneInfo("rclone", (1, 70, 0)),
+            run_id_factory=lambda: "reference-blocked",
+            planner=lambda *args, **kwargs: successful_plan(config),
+            safety_checker=reject,
+        )
+
+    assert seen[0].kind == ("known_good" if with_known_good else "baseline")
+    assert seen[0].file_count == (3 if with_known_good else 99)
