@@ -13,6 +13,8 @@ parsed into path-level `execution_items`; errors, unsafe paths, invalid sizes, a
 unknown operation types are not silently counted. An independent
 `execution-<run-id>.json` is written before the backup summary. The backup summary
 reports executed counters from these events, never from dry-run totals.
+Every recorded archive event is also checked against the real history tree;
+missing, extra, or differently-sized history files fail reconciliation.
 
 ## Reconciliation policy
 

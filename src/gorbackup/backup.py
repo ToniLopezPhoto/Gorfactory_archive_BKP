@@ -199,6 +199,39 @@ def reconcile_execution(plan: PlanResult, executed: Sequence[ExecutionItem]) -> 
     return tuple(divergences)
 
 
+def audit_history(history_path: Path, executed: Sequence[ExecutionItem]) -> Tuple[Divergence, ...]:
+    """Reconcile recorded archive events with files actually preserved in history."""
+    recorded = {
+        item.path: item.size
+        for item in executed
+        if item.operation == "archive" and item.classification != "deleted"
+    }
+    observed: Dict[str, int] = {}
+    for path in history_path.rglob("*"):
+        if path.is_file():
+            observed[path.relative_to(history_path).as_posix()] = path.stat().st_size
+    divergences: List[Divergence] = []
+    for path, size in recorded.items():
+        actual_size = observed.get(path)
+        if actual_size is None:
+            divergences.append(Divergence(
+                "failure", "archive_missing_from_history", "archive", path,
+                size, None, "rclone reported an archive event but history has no file",
+            ))
+        elif actual_size != size:
+            divergences.append(Divergence(
+                "failure", "archive_history_byte_mismatch", "archive", path,
+                size, actual_size, "history file size differs from rclone execution evidence",
+            ))
+    for path, size in observed.items():
+        if path not in recorded:
+            divergences.append(Divergence(
+                "failure", "unrecorded_history_file", "archive", path,
+                None, size, "history contains a file absent from execution evidence",
+            ))
+    return tuple(divergences)
+
+
 def run_backup(config: AppConfig, rclone: RcloneInfo, *,
                runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
                now: Callable[[], datetime] = _utc_now,
@@ -243,7 +276,7 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
             executed, log_warnings, log_errors = parse_execution_log(log_path.read_text(encoding="utf-8").splitlines())
             if completed.returncode != 0 and not log_errors:
                 log_errors.append((completed.stderr or completed.stdout).strip() or f"rclone exited with {completed.returncode}")
-            divergences = reconcile_execution(plan, executed)
+            divergences = reconcile_execution(plan, executed) + audit_history(history_path, executed)
             errors = list(log_errors) + [item.detail for item in divergences if item.severity == "failure"]
             warnings = list(log_warnings) + [item.detail for item in divergences if item.severity == "warning"]
             status = "failed" if completed.returncode != 0 or errors else "warning" if warnings else "success"

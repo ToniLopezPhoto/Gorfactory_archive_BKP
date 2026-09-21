@@ -109,6 +109,9 @@ def test_backup_executes_sync_with_unique_versioned_history(tmp_path: Path) -> N
 
     def runner(command, **kwargs):
         commands.append(command)
+        history = Path(command[command.index("--backup-dir") + 1])
+        (history / "changed.tif").write_bytes(b"old!")
+        (history / "old.tif").write_bytes(b"older")
         Path(command[command.index("--log-file") + 1]).write_text(
             '{"level":"info","msg":"Copied (new)","object":"new.tif","size":3}\n'
             '{"level":"info","msg":"Moved (server-side)","object":"changed.tif","size":4}\n'
@@ -235,6 +238,19 @@ def test_execution_log_is_machine_readable_and_rejects_ambiguous_events() -> Non
     ]
     assert warnings == []
     assert errors == ["invalid JSON execution log line 3"]
+
+
+def test_reported_archive_must_exist_in_history(tmp_path: Path) -> None:
+    from gorbackup.backup import audit_history
+
+    history = tmp_path / "history"
+    history.mkdir()
+    divergences = audit_history(
+        history, [ExecutionItem("archive", "versioned", "missing.tif", 5, "Moved")]
+    )
+
+    assert divergences[0].divergence_type == "archive_missing_from_history"
+    assert divergences[0].severity == "failure"
 
 
 @pytest.mark.parametrize(
