@@ -155,7 +155,9 @@ def test_plan_is_dry_run_persisted_and_classifies_rename_and_recent(tmp_path: Pa
     } == original_current
     payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert payload["dry_run"] is True
-    assert payload["transfer_bytes"] == result.transfer_bytes
+    assert payload["planned_transfer_bytes"] == result.planned_transfer_bytes
+    assert payload["catalogue_file_count"] == 4
+    assert payload["catalogue_total_bytes"] == 22
     with Ledger(config.ledger_path) as ledger:
         run = ledger.latest_successful_run()
         assert run is not None and run["run_id"] == "plan-run-1"
@@ -187,3 +189,22 @@ def test_rclone_json_error_persists_failed_plan(tmp_path: Path) -> None:
         history = ledger.run_history()
         assert history[0]["status"] == "failed"
         assert "permission denied" in history[0]["errors_json"]
+
+
+def test_plan_fails_if_catalogue_changes_during_dry_run(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    (config.source.path / "stable.tif").write_bytes(b"stable")
+
+    def runner(command, **kwargs):
+        (config.source.path / "arrived-during-plan.tif").write_bytes(b"late")
+        Path(command[command.index("--combined") + 1]).write_text("", encoding="utf-8")
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "unstable-plan",
+    )
+
+    assert result.status == "failed"
+    assert any("changed while" in item.reason for item in result.items)

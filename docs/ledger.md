@@ -1,56 +1,42 @@
-# Metadata inventory and run ledger
+# Ledger model
 
-`gorbackup scan` inventories the source catalogue without opening or hashing file
-contents. For every regular file it records the relative path, byte size and
-nanosecond modification time. A checksum remains optional and a previously known
-checksum is retained while size and modification time remain unchanged.
+The SQLite ledger separates five stages that must never be treated as
+interchangeable:
 
-## Run a scan
+1. **catalogue** — a complete metadata inventory of the source;
+2. **plan** — immutable operations reported by a dry-run;
+3. **execution** — successful path operations reported by the real rclone run;
+4. **reconciliation** — the comparison between planned and executed operations;
+5. **known-good state** — the catalogue snapshot promoted only after an exact,
+   successful reconciliation.
 
-With the expected source and archive volumes mounted:
+## Metrics have one meaning
 
-```sh
-gorbackup --config config/config.yaml scan
-```
+Every run exposes explicit counters. Catalogue inventory uses
+`catalogue_file_count` and `catalogue_total_bytes`. Plans use
+`planned_transfer_files/bytes` and `planned_archive_files/bytes`. Real execution
+uses `executed_transfer_files/bytes` and `executed_archive_files/bytes`.
 
-The normal preflight checks run first. SQLite state is stored at:
+There is no generic `file_count` or `total_bytes`: those names previously mixed
+inventory, intent, and outcome. Path evidence is retained in `plan_items`,
+`execution_items`, and `reconciliation_items`.
 
-```text
-<archive.root>/<state.directory>/<state.ledger_file>
-```
+## Transaction and publication rules
 
-Readable summaries are written beneath `state.manifests_dir` as an immutable
-per-run JSON file and `latest-scan.json`.
+`gorbackup scan` stages the complete source walk and replaces `catalogue_files`
+only in the transaction that marks the scan successful. A failed or interrupted
+scan leaves the previous catalogue snapshot intact.
 
-## Transactional safety
+A plan stores its own complete catalogue snapshot and operation list. The real
+run writes a separate `execution-<run-id>.json`; dry-run output is never reused
+as execution evidence. Only an execution with status `success` and reconciliation
+`exact` can replace `known_good_files` and `known_good_state`. `warning`, `failed`,
+incomplete (`running`), or unparseable runs retain their evidence but cannot
+advance known-good state.
 
-Each scan receives a unique run ID and is initially recorded as `running`. File
-metadata is written to a run-specific staging table in batches. Only after the
-entire source traversal succeeds does one SQLite transaction:
+## Schema migration
 
-1. calculate added, modified and deleted paths;
-2. replace the current inventory;
-3. mark the run successful with final totals.
-
-If traversal fails or the SAM disappears, staging is discarded, the run is marked
-`failed`, and the previous known-good inventory remains unchanged. An interrupted
-process leaves a distinguishable `running` record rather than publishing partial
-state.
-
-## Available queries
-
-The ledger API can return:
-
-- the latest successful run;
-- current total file count and bytes;
-- added and modified files for a run;
-- deleted paths for a run;
-- historical run summaries, including warnings, errors and transfer counters.
-
-Run rows include source and destination identities plus counters for copied, moved
-and archived bytes. Those transfer counters remain zero for metadata-only scans
-and are ready for later backup workflows.
-
-Dry-run plans are stored in the same ledger through the `plans` and `plan_items`
-tables. Their run rows use operation `plan`; failed plans remain distinguishable
-and never affect the successful catalogue inventory.
+Schema v2 is deliberately clean because the project is pre-production. Opening
+a v1 database atomically removes its ambiguous run/inventory tables and creates
+the v2 schema with `PRAGMA user_version = 2`. The next scan/plan rebuilds state;
+no v1 `total_bytes` value is guessed into a new semantic field.

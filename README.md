@@ -63,7 +63,8 @@ To generate and persist a machine-readable dry-run before any backup execution:
 gorbackup --config config/config.yaml plan
 ```
 
-The preview reports transfer and `current/` departure counts/bytes, rename
+The preview reports explicit catalogue, planned-transfer, and planned-archive
+counts/bytes, rename
 candidates, recent files and errors. See [docs/planning.md](docs/planning.md).
 
 To execute the same non-destructive sync shape, preserving every displaced file
@@ -73,7 +74,9 @@ under a unique history directory:
 gorbackup --config config/config.yaml backup
 ```
 
-See [docs/backup.md](docs/backup.md) for execution and recovery semantics.
+The real run records independent machine-readable execution evidence and
+reconciles it path by path against the immutable plan. See
+[docs/backup.md](docs/backup.md) for execution, divergence, and recovery semantics.
 
 ## Development
 

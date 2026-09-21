@@ -1,5 +1,6 @@
-"""Versioned, non-destructive incremental backup execution."""
+"""Versioned backup execution backed by independent rclone evidence."""
 
+import json
 import os
 import subprocess
 import tempfile
@@ -7,17 +8,37 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from gorbackup.config import AppConfig
 from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import Ledger, validate_state_location
-from gorbackup.planner import PlanResult, _atomic_json, create_plan, parse_json_log
+from gorbackup.planner import PlanResult, _atomic_json, create_plan
 from gorbackup.safety import SafetyAssessment, assess_plan_safety
 
 
 class BackupError(RuntimeError):
-    """Raised when a backup cannot be completed safely."""
+    """Raised when a backup cannot be completed or reconciled safely."""
+
+
+@dataclass(frozen=True)
+class ExecutionItem:
+    operation: str
+    classification: str
+    path: str
+    size: int
+    message: str
+
+
+@dataclass(frozen=True)
+class Divergence:
+    severity: str
+    divergence_type: str
+    operation: str
+    path: str
+    planned_bytes: Optional[int]
+    executed_bytes: Optional[int]
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -25,38 +46,171 @@ class BackupResult:
     run_id: str
     plan_run_id: str
     status: str
-    transferred_files: int
-    transferred_bytes: int
-    archived_files: int
-    archived_bytes: int
+    executed_transfer_files: int
+    executed_transfer_bytes: int
+    executed_archive_files: int
+    executed_archive_bytes: int
     safety: SafetyAssessment
     history_path: Path
+    report_path: Path
     manifest_path: Path
+    divergences: Tuple[Divergence, ...]
+
+    # Transitional API aliases; their meaning is always executed, never planned.
+    @property
+    def transferred_files(self) -> int:
+        return self.executed_transfer_files
+
+    @property
+    def transferred_bytes(self) -> int:
+        return self.executed_transfer_bytes
+
+    @property
+    def archived_files(self) -> int:
+        return self.executed_archive_files
+
+    @property
+    def archived_bytes(self) -> int:
+        return self.executed_archive_bytes
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def run_backup(
-    config: AppConfig,
-    rclone: RcloneInfo,
-    *,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-    now: Callable[[], datetime] = _utc_now,
-    run_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
-    planner: Callable[..., PlanResult] = create_plan,
-    safety_checker: Callable[..., SafetyAssessment] = assess_plan_safety,
-) -> BackupResult:
-    """Plan and execute one sync, preserving displaced files by run ID."""
+def parse_execution_log(lines: Iterable[str]) -> Tuple[List[ExecutionItem], List[str], List[str]]:
+    """Parse successful path operations from rclone's JSON log.
+
+    ``gorbackup_operation`` and ``gorbackup_classification`` are accepted by
+    synthetic fixtures. Production rclone entries are classified from its
+    stable operation messages while retaining the original message verbatim.
+    """
+    items: List[ExecutionItem] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    for number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            errors.append(f"invalid JSON execution log line {number}")
+            continue
+        if not isinstance(entry, dict):
+            errors.append(f"invalid execution log entry {number}")
+            continue
+        level = str(entry.get("level", "")).lower()
+        message = str(entry.get("msg", ""))
+        path = entry.get("object")
+        size = entry.get("size", 0)
+        if level in {"error", "fatal"}:
+            errors.append(message or f"rclone error at line {number}")
+            continue
+        if level in {"warning", "warn"}:
+            warnings.append(message or f"rclone warning at line {number}")
+        operation = entry.get("gorbackup_operation")
+        classification = entry.get("gorbackup_classification")
+        if operation is None:
+            normalized = message.lower()
+            if normalized.startswith("copied"):
+                operation = "transfer"
+                classification = "replaced" if "replaced" in normalized else "new"
+            elif normalized.startswith("moved"):
+                operation = "archive"
+                classification = "versioned"
+            elif normalized.startswith("deleted"):
+                # With --backup-dir a direct deletion violates the preservation contract.
+                operation = "archive"
+                classification = "deleted"
+        if operation is None:
+            continue
+        if operation not in {"transfer", "archive"}:
+            errors.append(f"unknown execution operation at line {number}: {operation!r}")
+            continue
+        if not isinstance(path, str) or not path or path.startswith("/") or ".." in Path(path).parts:
+            errors.append(f"unsafe or missing execution path at line {number}")
+            continue
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            errors.append(f"invalid execution size at line {number}")
+            continue
+        items.append(ExecutionItem(operation, str(classification or "unknown"), path, size, message))
+    return items, warnings, errors
+
+
+def _planned_operations(plan: PlanResult) -> Dict[Tuple[str, str], Tuple[int, str]]:
+    operations: Dict[Tuple[str, str], Tuple[int, str]] = {}
+    for item in plan.items:
+        if item.category in {"new_file", "changed_file", "rename_move_candidate"}:
+            expected = "new" if item.category == "new_file" else "replaced"
+            operations[("transfer", item.path)] = (item.size, expected)
+        if item.category in {"delete_from_current", "changed_file", "rename_move_candidate"}:
+            archive_path = item.related_path if item.category == "rename_move_candidate" else item.path
+            if archive_path:
+                operations[("archive", archive_path)] = (item.leaving_size, "versioned")
+    return operations
+
+
+def reconcile_execution(plan: PlanResult, executed: Sequence[ExecutionItem]) -> Tuple[Divergence, ...]:
+    """Compare immutable planned operations with independently logged execution."""
+    planned = _planned_operations(plan)
+    actual: Dict[Tuple[str, str], ExecutionItem] = {}
+    divergences: List[Divergence] = []
+    for item in executed:
+        key = (item.operation, item.path)
+        if key in actual:
+            divergences.append(Divergence(
+                "failure", "duplicate_execution", item.operation, item.path,
+                planned.get(key, (None, ""))[0], item.size,
+                "multiple successful execution events make totals ambiguous",
+            ))
+        actual[key] = item
+    for key, (planned_bytes, planned_classification) in planned.items():
+        item = actual.get(key)
+        operation, path = key
+        if item is None:
+            divergences.append(Divergence(
+                "warning", "planned_not_executed", operation, path, planned_bytes, None,
+                "planned operation was absent from the successful execution log",
+            ))
+        elif item.size != planned_bytes:
+            divergences.append(Divergence(
+                "failure", "byte_mismatch", operation, path, planned_bytes, item.size,
+                "executed byte count differs from the immutable plan",
+            ))
+        elif operation == "transfer" and item.classification not in {planned_classification, "unknown"}:
+            divergences.append(Divergence(
+                "warning", "classification_changed", operation, path, planned_bytes, item.size,
+                f"planned {planned_classification} but rclone classified {item.classification}",
+            ))
+        elif operation == "archive" and item.classification == "deleted":
+            divergences.append(Divergence(
+                "failure", "not_versioned", operation, path, planned_bytes, item.size,
+                "rclone deleted a path instead of preserving it in backup-dir",
+            ))
+    for key, item in actual.items():
+        if key in planned:
+            continue
+        severity = "failure" if item.operation == "archive" else "warning"
+        divergences.append(Divergence(
+            severity, "unplanned_execution", item.operation, item.path, None, item.size,
+            "execution performed an operation absent from the immutable plan",
+        ))
+    return tuple(divergences)
+
+
+def run_backup(config: AppConfig, rclone: RcloneInfo, *,
+               runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+               now: Callable[[], datetime] = _utc_now,
+               run_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
+               planner: Callable[..., PlanResult] = create_plan,
+               safety_checker: Callable[..., SafetyAssessment] = assess_plan_safety) -> BackupResult:
     validate_state_location(config)
     plan = planner(config, rclone, runner=runner, now=now)
     if plan.status != "success":
         raise BackupError(f"refusing to execute failed plan: {plan.run_id}")
     safety = safety_checker(config, plan)
-
-    run_id = run_id_factory()
-    started_at = now()
+    run_id, started_at = run_id_factory(), now()
     current = config.archive.root / config.archive.current_dir
     history_path = config.archive.root / config.archive.history_dir / run_id
     try:
@@ -67,75 +221,45 @@ def run_backup(
         raise BackupError(f"could not reserve history target {history_path}: {exc}") from exc
 
     config.state_root.mkdir(parents=True, exist_ok=True)
-    descriptor, log_name = tempfile.mkstemp(
-        prefix=".backup-log-", suffix=".jsonl", dir=str(config.state_root)
-    )
+    descriptor, log_name = tempfile.mkstemp(prefix=".backup-log-", suffix=".jsonl", dir=str(config.state_root))
     os.close(descriptor)
     log_path = Path(log_name)
+    report_path = config.manifests_root / f"execution-{run_id}.json"
     command = [
-        rclone.executable,
-        "sync",
-        str(config.source.path),
-        str(current),
-        "--use-json-log",
-        "--log-level",
-        config.logging.level,
-        "--log-file",
-        str(log_path),
-        "--backup-dir",
-        str(history_path),
-        "--max-delete",
-        str(config.safety.max_deletes_per_run),
-        "--max-delete-size",
-        f"{int(config.safety.max_delete_size_gb * 1024 ** 3)}B",
-        "--exclude",
-        f"/{config.source.marker_file}",
-        "--retries",
-        "1",
+        rclone.executable, "sync", str(config.source.path), str(current),
+        "--use-json-log", "--log-level", "INFO", "--log-file", str(log_path),
+        "--backup-dir", str(history_path), "--max-delete", str(config.safety.max_deletes_per_run),
+        "--max-delete-size", f"{int(config.safety.max_delete_size_gb * 1024 ** 3)}B",
+        "--exclude", f"/{config.source.marker_file}", "--retries", "1",
     ]
     if config.safety.ignore_recent_minutes:
         command.extend(["--min-age", f"{config.safety.ignore_recent_minutes}m"])
 
-    transferred_files = sum(
-        plan.counts[name]
-        for name in ("new_file", "changed_file", "rename_move_candidate")
-    )
-    archived_files = sum(
-        plan.counts[name]
-        for name in ("delete_from_current", "changed_file", "rename_move_candidate")
-    )
-    warnings = []
     with Ledger(config.ledger_path) as ledger:
-        ledger.start_run(
-            run_id,
-            started_at.isoformat(),
-            config.source.marker_id,
-            config.archive.marker_id,
-            operation="backup",
-        )
+        ledger.start_run(run_id, started_at.isoformat(), config.source.marker_id,
+                         config.archive.marker_id, operation="backup")
         try:
             completed = runner(command, check=False, capture_output=True, text=True)
-            log_errors, warnings = parse_json_log(
-                log_path.read_text(encoding="utf-8").splitlines()
-            )
-            if completed.returncode != 0 or log_errors:
-                details = [item.reason for item in log_errors]
-                if not details:
-                    details.append(
-                        (completed.stderr or completed.stdout).strip()
-                        or f"rclone exited with {completed.returncode}"
-                    )
-                raise BackupError("; ".join(details))
+            executed, log_warnings, log_errors = parse_execution_log(log_path.read_text(encoding="utf-8").splitlines())
+            if completed.returncode != 0 and not log_errors:
+                log_errors.append((completed.stderr or completed.stdout).strip() or f"rclone exited with {completed.returncode}")
+            divergences = reconcile_execution(plan, executed)
+            errors = list(log_errors) + [item.detail for item in divergences if item.severity == "failure"]
+            warnings = list(log_warnings) + [item.detail for item in divergences if item.severity == "warning"]
+            status = "failed" if completed.returncode != 0 or errors else "warning" if warnings else "success"
             completed_at = now()
-            ledger.complete_backup(
-                run_id,
-                plan.run_id,
-                completed_at.isoformat(),
-                str(history_path),
-                transferred_files,
-                plan.transfer_bytes,
-                plan.leaving_current_bytes,
-                warnings,
+            report = {
+                "schema_version": 2, "run_id": run_id, "plan_run_id": plan.run_id,
+                "status": status, "started_at": started_at.isoformat(), "completed_at": completed_at.isoformat(),
+                "items": [asdict(item) for item in executed],
+                "divergences": [asdict(item) for item in divergences],
+                "warnings": warnings, "errors": errors,
+            }
+            _atomic_json(report_path, report)
+            ledger.complete_execution(
+                run_id, plan.run_id, completed_at.isoformat(), status, str(history_path),
+                str(report_path), [asdict(item) for item in executed],
+                [asdict(item) for item in divergences], warnings, errors,
             )
         except Exception as exc:
             ledger.fail_run(run_id, now().isoformat(), str(exc))
@@ -146,39 +270,32 @@ def run_backup(
             if log_path.exists():
                 log_path.unlink()
 
+    if status == "failed":
+        raise BackupError("backup execution could not be reconciled; see " + str(report_path))
+    transfers = [item for item in executed if item.operation == "transfer"]
+    archives = [item for item in executed if item.operation == "archive"]
     manifest_path = config.manifests_root / f"backup-{run_id}.json"
     payload = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "plan_run_id": plan.run_id,
-        "status": "success",
-        "started_at": started_at.isoformat(),
-        "completed_at": completed_at.isoformat(),
-        "history_path": str(history_path),
-        "transferred_files": transferred_files,
-        "transferred_bytes": plan.transfer_bytes,
-        "archived_files": archived_files,
-        "archived_bytes": plan.leaving_current_bytes,
-        "warnings": warnings,
-        "safety": asdict(safety),
-        "plan": [asdict(item) for item in plan.items],
+        "schema_version": 2, "run_id": run_id, "plan_run_id": plan.run_id, "status": status,
+        "started_at": started_at.isoformat(), "completed_at": completed_at.isoformat(),
+        "history_path": str(history_path), "execution_report": str(report_path),
+        "catalogue_file_count": plan.catalogue_file_count, "catalogue_total_bytes": plan.catalogue_total_bytes,
+        "planned_transfer_files": plan.planned_transfer_files, "planned_transfer_bytes": plan.planned_transfer_bytes,
+        "planned_archive_files": plan.planned_archive_files, "planned_archive_bytes": plan.planned_archive_bytes,
+        "executed_transfer_files": len(transfers), "executed_transfer_bytes": sum(i.size for i in transfers),
+        "executed_archive_files": len(archives), "executed_archive_bytes": sum(i.size for i in archives),
+        "warnings": warnings, "divergences": [asdict(item) for item in divergences], "safety": asdict(safety),
     }
     try:
         _atomic_json(manifest_path, payload)
         _atomic_json(config.manifests_root / "latest-backup.json", payload)
     except OSError as exc:
-        raise BackupError(
-            f"backup succeeded but manifest could not be written: {exc}"
-        ) from exc
-    return BackupResult(
-        run_id,
-        plan.run_id,
-        "success",
-        transferred_files,
-        plan.transfer_bytes,
-        archived_files,
-        plan.leaving_current_bytes,
-        safety,
-        history_path,
-        manifest_path,
-    )
+        with Ledger(config.ledger_path) as ledger:
+            ledger.invalidate_completed_run(run_id, str(exc))
+        raise BackupError(f"backup completed but manifest could not be written: {exc}") from exc
+    if status == "success":
+        with Ledger(config.ledger_path) as ledger:
+            ledger.promote_known_good(run_id)
+    return BackupResult(run_id, plan.run_id, status, len(transfers), sum(i.size for i in transfers),
+                        len(archives), sum(i.size for i in archives), safety, history_path,
+                        report_path, manifest_path, divergences)

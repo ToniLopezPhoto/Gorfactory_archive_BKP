@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from gorbackup.config import AppConfig
 from gorbackup.dependencies import RcloneInfo
-from gorbackup.ledger import Ledger, validate_state_location
+from gorbackup.ledger import Ledger, inventory_source, validate_state_location
 
 CATEGORIES = (
     "new_file",
@@ -46,9 +46,21 @@ class PlanResult:
     items: Tuple[PlanItem, ...]
     counts: Dict[str, int]
     byte_totals: Dict[str, int]
-    transfer_bytes: int
-    leaving_current_bytes: int
+    catalogue_file_count: int
+    catalogue_total_bytes: int
+    planned_transfer_files: int
+    planned_transfer_bytes: int
+    planned_archive_files: int
+    planned_archive_bytes: int
     manifest_path: Path
+
+    @property
+    def transfer_bytes(self) -> int:
+        return self.planned_transfer_bytes
+
+    @property
+    def leaving_current_bytes(self) -> int:
+        return self.planned_archive_bytes
 
 
 def _utc_now() -> datetime:
@@ -308,12 +320,29 @@ def create_plan(
             operation="plan",
         )
         try:
+            catalogue_before = tuple(sorted(
+                inventory_source(config.source.path, config.source.marker_file),
+                key=lambda item: item.relative_path,
+            ))
             completed = runner(command, check=False, capture_output=True, text=True)
             combined_lines = combined_path.read_text(encoding="utf-8").splitlines()
             log_lines = log_path.read_text(encoding="utf-8").splitlines()
             items = parse_combined_plan(combined_lines, config.source.path, current)
             log_errors, warnings = parse_json_log(log_lines)
             items.extend(log_errors)
+            catalogue_files = tuple(sorted(
+                inventory_source(config.source.path, config.source.marker_file),
+                key=lambda item: item.relative_path,
+            ))
+            if catalogue_files != catalogue_before:
+                items.append(
+                    PlanItem(
+                        "error",
+                        "",
+                        0,
+                        "catalogue changed while the immutable plan was being generated",
+                    )
+                )
             cutoff = started - timedelta(minutes=config.safety.ignore_recent_minutes)
             items.extend(
                 find_recent_files(
@@ -345,6 +374,7 @@ def create_plan(
                 byte_totals,
                 warnings,
                 errors,
+                catalogue_files,
             )
         except Exception as exc:
             ledger.fail_run(run_id, now().isoformat(), str(exc))
@@ -356,22 +386,36 @@ def create_plan(
                 if temporary.exists():
                     temporary.unlink()
 
-    transfer_bytes = sum(
+    planned_transfer_bytes = sum(
         byte_totals[name]
         for name in ("new_file", "changed_file", "rename_move_candidate")
     )
-    leaving_current_bytes = sum(item.leaving_size for item in items)
+    planned_transfer_files = sum(
+        counts[name] for name in ("new_file", "changed_file", "rename_move_candidate")
+    )
+    planned_archive_items = tuple(
+        item for item in items
+        if item.category in {"delete_from_current", "changed_file", "rename_move_candidate"}
+    )
+    planned_archive_files = len(planned_archive_items)
+    planned_archive_bytes = sum(item.leaving_size for item in planned_archive_items)
+    catalogue_file_count = len(catalogue_files)
+    catalogue_total_bytes = sum(item.size for item in catalogue_files)
     manifest_path = config.manifests_root / f"plan-{run_id}.json"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "status": status,
         "created_at": completed_at,
         "dry_run": True,
         "counts": counts,
         "bytes": byte_totals,
-        "transfer_bytes": transfer_bytes,
-        "leaving_current_bytes": leaving_current_bytes,
+        "catalogue_file_count": catalogue_file_count,
+        "catalogue_total_bytes": catalogue_total_bytes,
+        "planned_transfer_files": planned_transfer_files,
+        "planned_transfer_bytes": planned_transfer_bytes,
+        "planned_archive_files": planned_archive_files,
+        "planned_archive_bytes": planned_archive_bytes,
         "warnings": warnings,
         "items": serialized,
     }
@@ -386,7 +430,11 @@ def create_plan(
         tuple(items),
         counts,
         byte_totals,
-        transfer_bytes,
-        leaving_current_bytes,
+        catalogue_file_count,
+        catalogue_total_bytes,
+        planned_transfer_files,
+        planned_transfer_bytes,
+        planned_archive_files,
+        planned_archive_bytes,
         manifest_path,
     )

@@ -1,40 +1,36 @@
-# Versioned incremental backup
+# Versioned execution and reconciliation
 
-`gorbackup backup` always generates a fresh dry-run plan before it executes an
-incremental `rclone sync`. If planning reports an error, execution is refused.
+`gorbackup backup` creates a fresh immutable plan, applies deletion/capacity
+safety gates, reserves a unique history directory, and then runs real rclone.
+Displaced files are directed to `history/<backup-run-id>/`; the source marker and
+recent-file window remain excluded. Tests and CI use only synthetic temporary
+trees and fake rclone reports.
 
-Before execution, the plan must also pass every configured safety gate:
+## Independent execution evidence
 
-- destination-only deletions (including rename candidates) must not exceed
-  `safety.max_deletes_per_run`;
-- their combined size must not exceed `safety.max_delete_size_gb`;
-- planned transfers must fit while retaining
-  `safety.min_free_space_percent` after the run.
+The real command emits a new JSON log. Successful copy and versioning events are
+parsed into path-level `execution_items`; errors, unsafe paths, invalid sizes, and
+unknown operation types are not silently counted. An independent
+`execution-<run-id>.json` is written before the backup summary. The backup summary
+reports executed counters from these events, never from dry-run totals.
 
-The deletion limits are also supplied to the real rclone command through
-`--max-delete` and `--max-delete-size`. This second layer aborts if the source or
-destination changes after planning and the live sync crosses a limit.
+## Reconciliation policy
 
-For every successful run, files that would be overwritten or removed from
-`current/` are moved, with their original relative paths, to:
+Each `(operation, path, bytes)` is compared with the immutable plan:
 
-```text
-history/<backup-run-id>/
-```
+- exact agreement is `success` and may promote known-good state;
+- a new/unexpected transfer, or a planned transfer/archive that no longer occurs,
+  is `warning` (typical source addition, removal, or recent-window transition);
+- a changed transfer classification is `warning`;
+- byte mismatch, duplicate successful event, unplanned archive/delete, direct
+  deletion instead of versioning, rclone error, or invalid/ambiguous evidence is
+  `failed`.
 
-The run ID is unique and an existing history directory is never reused. The
-source marker is excluded, the configured recent-file window is preserved, and
-the source is only ever passed to rclone as the sync source.
-
-The SQLite ledger records both the planning and backup runs. A JSON manifest is
-written to `state/manifests/backup-<run-id>.json` and mirrored as
-`latest-backup.json`; it links to the exact plan and records transferred and
-archived counts and bytes plus the accepted safety assessment.
+Warnings describe what actually happened and publish a degraded backup manifest,
+but cannot advance known-good state. Failures persist execution and reconciliation
+evidence and do not publish a success backup manifest. Existing history content is
+left for recovery and investigation.
 
 ```sh
 gorbackup --config config/config.yaml backup
 ```
-
-A non-zero rclone result or structured error log marks the backup run failed and
-does not publish a success manifest. Files already moved by rclone remain in the
-run's history directory for recovery and investigation.
