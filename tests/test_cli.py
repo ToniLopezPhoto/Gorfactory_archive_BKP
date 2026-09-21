@@ -72,7 +72,9 @@ def test_backup_runs_preflight(
             5,
             SafetyAssessment(1, 5, 10, 100, 90, 90.0),
             Path("history/backup-1"),
+            Path("execution.json"),
             Path("backup.json"),
+            (),
         ),
     )
 
@@ -163,7 +165,8 @@ def test_plan_command_prints_machine_counts(
         "error": 0,
     }
     result = PlanResult(
-        "plan-1", "success", (), counts, {}, 100, 50, Path("plan.json")
+        "plan-1", "success", (), counts, {}, 10, 1000, 3, 100, 5, 50,
+        Path("plan.json")
     )
     monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
     monkeypatch.setattr(
@@ -176,8 +179,8 @@ def test_plan_command_prints_machine_counts(
 
     assert main(["--config", "unused.yaml", "plan"]) == 0
     output = capsys.readouterr().out
-    assert "transfer_bytes=100" in output
-    assert "leave_current_files=5" in output
+    assert "planned_transfer_bytes=100" in output
+    assert "planned_archive_files=5" in output
 
 
 def test_failed_plan_returns_nonzero(
@@ -193,7 +196,8 @@ def test_failed_plan_returns_nonzero(
         "error": 1,
     }
     result = PlanResult(
-        "failed-plan", "failed", (), counts, {}, 0, 0, Path("failed-plan.json")
+        "failed-plan", "failed", (), counts, {}, 0, 0, 0, 0, 0, 0,
+        Path("failed-plan.json")
     )
     monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
     monkeypatch.setattr(

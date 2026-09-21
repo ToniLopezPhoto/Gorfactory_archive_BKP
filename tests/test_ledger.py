@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,8 +56,8 @@ def test_scan_inventories_metadata_and_answers_required_queries(tmp_path: Path) 
 
     result = run_scan(config, "run-1")
 
-    assert result.file_count == 2
-    assert result.total_bytes == 5
+    assert result.catalogue_file_count == 2
+    assert result.catalogue_total_bytes == 5
     assert result.changed_files == 2
     assert result.deleted_paths == 0
     assert result.summary_path.parent == config.manifests_root
@@ -64,7 +65,7 @@ def test_scan_inventories_metadata_and_answers_required_queries(tmp_path: Path) 
     with Ledger(config.ledger_path) as ledger:
         latest = ledger.latest_successful_run()
         assert latest is not None and latest["run_id"] == "run-1"
-        assert ledger.totals() == {"file_count": 2, "total_bytes": 5}
+        assert ledger.totals() == {"catalogue_file_count": 2, "catalogue_total_bytes": 5}
         assert [item["relative_path"] for item in ledger.changed_files("run-1")] == [
             "a.tif",
             "folder/b.jpg",
@@ -116,7 +117,7 @@ def test_failed_scan_does_not_replace_last_known_good_state(tmp_path: Path) -> N
         )
 
     with Ledger(config.ledger_path) as ledger:
-        assert ledger.totals() == {"file_count": 1, "total_bytes": 4}
+        assert ledger.totals() == {"catalogue_file_count": 1, "catalogue_total_bytes": 4}
         latest = ledger.latest_successful_run()
         assert latest is not None and latest["run_id"] == "good-run"
         history = ledger.run_history()
@@ -132,14 +133,14 @@ def test_unchanged_file_keeps_known_optional_checksum(tmp_path: Path) -> None:
     with Ledger(config.ledger_path) as ledger:
         with ledger.connection:
             ledger.connection.execute(
-                "UPDATE current_files SET checksum = 'sha1:known' WHERE relative_path = 'photo.tif'"
+                "UPDATE catalogue_files SET checksum = 'sha1:known' WHERE relative_path = 'photo.tif'"
             )
 
     run_scan(config, "run-2")
 
     with Ledger(config.ledger_path) as ledger:
         row = ledger.connection.execute(
-            "SELECT checksum FROM current_files WHERE relative_path = 'photo.tif'"
+            "SELECT checksum FROM catalogue_files WHERE relative_path = 'photo.tif'"
         ).fetchone()
         assert row["checksum"] == "sha1:known"
         assert ledger.changed_files("run-2") == []
@@ -158,3 +159,30 @@ def test_state_database_must_live_under_archive(tmp_path: Path) -> None:
 
     with pytest.raises(LedgerError, match="must live under archive"):
         run_scan(config, "unsafe-run")
+
+
+def test_v1_ledger_is_migrated_to_clean_unambiguous_schema(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(str(path))
+    connection.executescript(
+        """
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY, file_count INTEGER, total_bytes INTEGER
+        );
+        INSERT INTO runs VALUES ('legacy', 2, 5);
+        CREATE TABLE current_files (relative_path TEXT PRIMARY KEY);
+        """
+    )
+    connection.close()
+
+    with Ledger(path) as ledger:
+        columns = {
+            row["name"]
+            for row in ledger.connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        assert ledger.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert "catalogue_file_count" in columns
+        assert "planned_transfer_bytes" in columns
+        assert "executed_archive_bytes" in columns
+        assert "total_bytes" not in columns
+        assert ledger.run_history() == []

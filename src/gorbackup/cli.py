@@ -126,12 +126,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "backup":
         print(
-            f"backup: success; run_id={backup_result.run_id}; "
+            f"backup: {backup_result.status}; run_id={backup_result.run_id}; "
             f"plan_run_id={backup_result.plan_run_id}; "
-            f"transferred_files={backup_result.transferred_files}; "
-            f"transferred_bytes={backup_result.transferred_bytes}; "
-            f"archived_files={backup_result.archived_files}; "
-            f"archived_bytes={backup_result.archived_bytes}; "
+            f"executed_transfer_files={backup_result.executed_transfer_files}; "
+            f"executed_transfer_bytes={backup_result.executed_transfer_bytes}; "
+            f"executed_archive_files={backup_result.executed_archive_files}; "
+            f"executed_archive_bytes={backup_result.executed_archive_bytes}; "
             f"delete_count={backup_result.safety.delete_count}; "
             f"delete_bytes={backup_result.safety.delete_bytes}; "
             f"projected_free_percent="
@@ -144,7 +144,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "scan":
         print(
             f"scan: success; run_id={scan_result.run_id}; "
-            f"files={scan_result.file_count}; bytes={scan_result.total_bytes}; "
+            f"catalogue_files={scan_result.catalogue_file_count}; "
+            f"catalogue_bytes={scan_result.catalogue_total_bytes}; "
             f"changed={scan_result.changed_files}; deleted={scan_result.deleted_paths}"
         )
         return 0
@@ -164,10 +165,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         print(
             f"plan: {plan_result.status}; run_id={plan_result.run_id}; "
-            f"transfer_files={transfer_files}; "
-            f"transfer_bytes={plan_result.transfer_bytes}; "
-            f"leave_current_files={leaving_files}; "
-            f"leave_current_bytes={plan_result.leaving_current_bytes}; "
+            f"catalogue_files={plan_result.catalogue_file_count}; "
+            f"catalogue_bytes={plan_result.catalogue_total_bytes}; "
+            f"planned_transfer_files={plan_result.planned_transfer_files}; "
+            f"planned_transfer_bytes={plan_result.planned_transfer_bytes}; "
+            f"planned_archive_files={plan_result.planned_archive_files}; "
+            f"planned_archive_bytes={plan_result.planned_archive_bytes}; "
             f"rename_candidates={plan_result.counts['rename_move_candidate']}; "
             f"skipped_recent={plan_result.counts['skipped_recent']}; "
             f"errors={plan_result.counts['error']}; manifest={plan_result.manifest_path}"

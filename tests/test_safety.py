@@ -34,7 +34,11 @@ def make_plan(*items: PlanItem, transfer_bytes: int = 0) -> PlanResult:
         items,
         {},
         {},
+        0,
+        0,
+        0,
         transfer_bytes,
+        len([item for item in items if item.leaving_size]),
         sum(item.leaving_size for item in items),
         Path("plan.json"),
     )
