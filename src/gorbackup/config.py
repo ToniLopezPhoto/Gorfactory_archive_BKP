@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 import yaml
 
@@ -48,6 +48,9 @@ class SafetyConfig:
 @dataclass(frozen=True)
 class RetentionConfig:
     auto_prune: bool
+    keep_days: int = 365
+    keep_min_runs: int = 30
+    target_free_percent: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +229,20 @@ def load_config(path: Path) -> AppConfig:
     auto_prune = _required(retention, "retention", "auto_prune")
     if not isinstance(auto_prune, bool):
         raise ConfigError("'retention.auto_prune' must be true or false")
+    if auto_prune:
+        raise ConfigError("automatic pruning is not enabled in this release; retention.auto_prune must be false")
+    retention_keep_days = retention.get("keep_days", 365)
+    retention_keep_min_runs = retention.get("keep_min_runs", 30)
+    for name, value in (("keep_days", retention_keep_days), ("keep_min_runs", retention_keep_min_runs)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ConfigError(f"'retention.{name}' must be a non-negative integer")
+    target_free_percent = retention.get("target_free_percent")
+    if target_free_percent is not None:
+        target_free_percent = _positive_number(
+            target_free_percent, "retention.target_free_percent", allow_zero=True
+        )
+        if target_free_percent > 100:
+            raise ConfigError("'retention.target_free_percent' must not exceed 100")
 
     level = logging.get("level", "INFO")
     directory = logging.get("directory", "logs")
@@ -302,7 +319,10 @@ def load_config(path: Path) -> AppConfig:
             ),
             max_changed_catalogue_percent=float(percent_thresholds["max_changed_catalogue_percent"]),
         ),
-        retention=RetentionConfig(auto_prune=auto_prune),
+        retention=RetentionConfig(
+            auto_prune, retention_keep_days, retention_keep_min_runs,
+            target_free_percent,
+        ),
         logging=LoggingConfig(level.upper(), Path(directory), keep_days),
         state=StateConfig(
             Path(state_directory),

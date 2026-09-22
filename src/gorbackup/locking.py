@@ -16,6 +16,40 @@ class LockError(RuntimeError):
     """Raised when exclusive backup ownership cannot be established."""
 
 
+class HistoryLock:
+    """POSIX shared/exclusive lock coordinating history readers and writers."""
+
+    def __init__(self, path: Path, *, exclusive: bool) -> None:
+        self.path = path
+        self.exclusive = exclusive
+        self._descriptor: Optional[int] = None
+
+    def acquire(self) -> "HistoryLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            mode = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            kind = "exclusive" if self.exclusive else "shared"
+            raise LockError(f"history {kind} lock is busy: {self.path}") from exc
+        self._descriptor = descriptor
+        return self
+
+    def release(self) -> None:
+        if self._descriptor is not None:
+            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def __enter__(self) -> "HistoryLock":
+        return self.acquire()
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.release()
+
+
 def process_is_alive(pid: int) -> bool:
     """Return whether *pid* exists, treating inaccessible processes as alive."""
     try:

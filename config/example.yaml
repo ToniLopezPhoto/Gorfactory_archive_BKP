@@ -30,6 +30,9 @@ safety:
 
 retention:
   auto_prune: false
+  keep_days: 365
+  keep_min_runs: 30
+  target_free_percent: null
 
 rename_optimization:
   enabled: true

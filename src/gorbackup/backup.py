@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from gorbackup.config import AppConfig
 from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import Ledger, validate_state_location
-from gorbackup.locking import BackupLock
+from gorbackup.locking import BackupLock, HistoryLock
 from gorbackup.planner import PlanResult, _atomic_json, create_plan
 from gorbackup.baseline import load_baseline_summary
 from gorbackup.safety import (
@@ -305,7 +305,8 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
         run_id=f"backup-attempt-{uuid.uuid4().hex}",
         now=now,
     )
-    with lock:
+    # Mutation lock order is always BackupLock -> HistoryLock(EXCLUSIVE).
+    with lock, HistoryLock(config.state_root / ".history-access.lock", exclusive=True):
         journals = list(config.state_root.glob(".rename-journal-*.json")) if config.state_root.exists() else []
         if journals:
             raise BackupError(

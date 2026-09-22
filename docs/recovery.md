@@ -77,9 +77,11 @@ success, or failed status. Restore does not alter backup-run metrics or
 known-good state. The selected file remains unchanged in `history/` after
 recovery.
 
-Restore does not take the backup lock: it only reads history belonging to a
-backup run whose final status is `success` or `warning`, and it writes to a
-separate staging area. Runs that are `running`, `blocked`, or `failed` are not
+Restore takes a shared `.history-access.lock` while it reads and copies history;
+multiple restores can coexist, while backup and prune take the lock exclusively.
+It only reads history belonging to a backup run whose final status is `success`
+or `warning`, and writes to a separate staging area. Runs that are `running`,
+`blocked`, or `failed` are not
 eligible, which prevents recovery from a history directory still being
 written. `history` may display their recorded evidence and status for
 diagnosis, but remains read-only.
