@@ -14,6 +14,7 @@ from gorbackup.ledger import LedgerError, scan_catalogue
 from gorbackup.locking import LockError
 from gorbackup.planner import PlanError, create_plan
 from gorbackup.preflight import PreflightError, run_preflight
+from gorbackup.recovery import RecoveryError, find_history, restore_version
 from gorbackup.safety import SafetyError
 from gorbackup.verification import VerificationError, verify_selected
 
@@ -24,6 +25,7 @@ COMMANDS = (
     "plan",
     "status",
     "verify",
+    "history",
     "restore",
     "audit",
 )
@@ -55,6 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
                 if command == "scan"
                 else "generate a non-destructive backup plan"
                 if command == "plan"
+                else "list current and archived versions"
+                if command == "history"
+                else "copy one historical version into recovery staging"
+                if command == "restore"
                 else f"{command} operation (placeholder)"
             ),
             description=(
@@ -66,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
                 if command == "scan"
                 else "Run rclone in dry-run mode and persist a classified plan."
                 if command == "plan"
+                else "Discover versions from ledger evidence and confirm them on disk."
+                if command == "history"
+                else "Safely copy and verify a historical version without touching the source."
+                if command == "restore"
                 else f"Validate prerequisites for the future {command} operation."
             ),
         )
@@ -86,6 +96,18 @@ def build_parser() -> argparse.ArgumentParser:
                 "paths", nargs="+", metavar="PATH",
                 help="relative source file or directory (directories are recursive)",
             )
+        if command == "history":
+            subparser.add_argument("path", metavar="PATH", help="relative catalogue path")
+        if command == "restore":
+            subparser.add_argument("path", metavar="PATH", help="relative catalogue path")
+            subparser.add_argument(
+                "--run", required=True, dest="run_id", metavar="RUN_ID",
+                help="backup run containing the historical version",
+            )
+            subparser.add_argument(
+                "--destination", type=Path, metavar="DIRECTORY",
+                help="explicit absolute staging root outside the archive",
+            )
     return parser
 
 
@@ -93,7 +115,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = load_config(args.config)
-        rclone = check_rclone()
+        rclone = check_rclone() if args.command not in {"history", "restore"} else None
         preflight = None
         if args.command in {"backup", "baseline", "scan", "plan", "verify"}:
             baseline = (
@@ -129,6 +151,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 config.archive.root / config.archive.current_dir,
                 args.paths,
             )
+        if args.command == "history":
+            history_result = find_history(config, args.path)
+        if args.command == "restore":
+            restore_result = restore_version(
+                config, args.path, args.run_id, destination=args.destination
+            )
     except (
         ConfigError,
         DependencyError,
@@ -140,6 +168,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         SafetyError,
         LockError,
         VerificationError,
+        RecoveryError,
     ) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
@@ -222,6 +251,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"failures={verification_result.failures}"
         )
         return 0 if not verification_result.failures else 2
+
+    if args.command == "history":
+        print(f"Versions for {history_result.relative_path}")
+        print("\nCurrent")
+        if history_result.current is None:
+            print("not present")
+        else:
+            item = history_result.current
+            checksum = item.checksum or "checksum unavailable"
+            print(f"current | {item.size} bytes | {checksum}")
+        print("\nHistory")
+        if not history_result.versions:
+            print("no archived versions recorded")
+        for item in history_result.versions:
+            availability = "available" if item.exists else "recorded but missing"
+            checksum = item.checksum or "checksum unavailable"
+            print(
+                f"{item.timestamp} | run {item.run_id} | {item.size} bytes | "
+                f"{checksum} | {item.reason} | run={item.run_status} | {availability}"
+            )
+        return 0
+
+    if args.command == "restore":
+        print(
+            f"restore: success; restore_id={restore_result.restore_id}; "
+            f"run_id={restore_result.source_run_id}; bytes={restore_result.bytes_copied}; "
+            f"checksum=sha256:{restore_result.checksum}; "
+            f"destination={restore_result.destination_path}"
+        )
+        return 0
 
     version = ".".join(str(part) for part in rclone.version)
     print(

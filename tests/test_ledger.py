@@ -180,9 +180,39 @@ def test_v1_ledger_is_migrated_to_clean_unambiguous_schema(tmp_path: Path) -> No
             row["name"]
             for row in ledger.connection.execute("PRAGMA table_info(runs)").fetchall()
         }
-        assert ledger.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert ledger.connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert "catalogue_file_count" in columns
         assert "planned_transfer_bytes" in columns
         assert "executed_archive_bytes" in columns
         assert "total_bytes" not in columns
         assert ledger.run_history() == []
+
+
+def test_v4_migration_preserves_backup_evidence_and_adds_restore_tables(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v4.sqlite3"
+    with Ledger(path) as ledger:
+        ledger.start_run("kept-run", FIXED_TIME.isoformat(), "source", "archive")
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        DROP INDEX idx_restore_runs_started;
+        DROP TABLE restore_runs;
+        ALTER TABLE execution_items DROP COLUMN checksum;
+        PRAGMA user_version = 4;
+        """
+    )
+    connection.close()
+
+    with Ledger(path) as ledger:
+        assert ledger.connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert ledger.run_history()[0]["run_id"] == "kept-run"
+        columns = {
+            row["name"]
+            for row in ledger.connection.execute(
+                "PRAGMA table_info(execution_items)"
+            ).fetchall()
+        }
+        assert "checksum" in columns
+        assert ledger.restore_history() == []

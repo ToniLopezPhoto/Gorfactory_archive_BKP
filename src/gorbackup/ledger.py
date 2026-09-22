@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from gorbackup.config import AppConfig
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class LedgerError(RuntimeError):
@@ -137,6 +137,7 @@ CREATE TABLE execution_items (
     classification TEXT NOT NULL,
     path TEXT NOT NULL,
     size INTEGER NOT NULL,
+    checksum TEXT,
     message TEXT NOT NULL
 );
 CREATE TABLE reconciliation_items (
@@ -176,12 +177,28 @@ CREATE TABLE known_good_state (
     promoted_at TEXT NOT NULL
 );
 
+CREATE TABLE restore_runs (
+    restore_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ('running', 'success', 'failed')),
+    relative_path TEXT NOT NULL,
+    source_run_id TEXT NOT NULL,
+    historical_source_path TEXT,
+    destination_path TEXT,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    verification_method TEXT,
+    checksum TEXT,
+    error TEXT
+);
+
 CREATE INDEX idx_runs_status_completed ON runs(status, completed_at DESC);
 CREATE INDEX idx_plan_items_run_category ON plan_items(run_id, category);
 CREATE INDEX idx_execution_items_run_operation ON execution_items(run_id, operation);
 CREATE INDEX idx_reconciliation_items_run ON reconciliation_items(run_id);
 CREATE INDEX idx_verification_items_run_status ON verification_items(run_id, status);
-PRAGMA user_version = 4;
+CREATE INDEX idx_restore_runs_started ON restore_runs(started_at DESC);
+PRAGMA user_version = 5;
 """
 
 _V1_TABLES = (
@@ -227,23 +244,67 @@ def validate_state_location(config: AppConfig) -> None:
 class Ledger:
     """Transactional access to catalogue, plan, and execution evidence."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(path))
+        if read_only:
+            self.connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(str(path))
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA synchronous = FULL")
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        self.schema_version = int(version)
         has_runs = self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
         ).fetchone()
-        if version not in (0, 1, 2, 3, SCHEMA_VERSION):
+        if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION):
             raise LedgerError(f"unsupported ledger schema version: {version}")
+        if read_only:
+            if not has_runs:
+                raise LedgerError(f"ledger does not exist or is not initialized: {path}")
+            return
+        if version == 4:
+            self._migrate_v4()
+            self.schema_version = SCHEMA_VERSION
+            return
         if version in (1, 2, 3) or (version == 0 and has_runs):
             self._migrate_v1()
+            self.schema_version = SCHEMA_VERSION
         elif not has_runs:
             self.connection.executescript(SCHEMA)
+            self.schema_version = SCHEMA_VERSION
+
+    def _migrate_v4(self) -> None:
+        """Add restore evidence without rewriting existing backup evidence."""
+        try:
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE restore_runs (
+                    restore_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('running', 'success', 'failed')),
+                    relative_path TEXT NOT NULL,
+                    source_run_id TEXT NOT NULL,
+                    historical_source_path TEXT,
+                    destination_path TEXT,
+                    bytes INTEGER NOT NULL DEFAULT 0,
+                    verification_method TEXT,
+                    checksum TEXT,
+                    error TEXT
+                );
+                ALTER TABLE execution_items ADD COLUMN checksum TEXT;
+                CREATE INDEX idx_restore_runs_started ON restore_runs(started_at DESC);
+                PRAGMA user_version = 5;
+                COMMIT;
+                """
+            )
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def _migrate_v1(self) -> None:
         """Pre-production v1 migration: replace ambiguous metrics atomically."""
@@ -325,14 +386,31 @@ class Ledger:
             "failed" if any(item["severity"] == "failure" for item in divergences)
             else "diverged" if divergences else "exact"
         )
+        prior_checksums = {
+            row["relative_path"]: (int(row["size"]), row["checksum"])
+            for row in self.connection.execute(
+                "SELECT relative_path, size, checksum FROM known_good_files"
+            )
+        }
+        evidence = []
+        for item in execution_items:
+            checksum = item.get("checksum")
+            prior = prior_checksums.get(str(item["path"]))
+            if (checksum is None and item["operation"] == "archive" and prior
+                    and prior[0] == int(item["size"])):
+                checksum = prior[1]
+            evidence.append((
+                run_id, item["operation"], item["classification"], item["path"],
+                item["size"], checksum, item["message"],
+            ))
         with self.connection:
             self.connection.execute(
                 "INSERT INTO executions (run_id, plan_run_id, history_path, report_path, reconciliation_status) VALUES (?, ?, ?, ?, ?)",
                 (run_id, plan_run_id, history_path, report_path, reconciliation),
             )
             self.connection.executemany(
-                "INSERT INTO execution_items (run_id, operation, classification, path, size, message) VALUES (?, ?, ?, ?, ?, ?)",
-                ((run_id, item["operation"], item["classification"], item["path"], item["size"], item["message"]) for item in execution_items),
+                "INSERT INTO execution_items (run_id, operation, classification, path, size, checksum, message) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                evidence,
             )
             self.connection.executemany(
                 "INSERT INTO reconciliation_items (run_id, severity, divergence_type, operation, path, planned_bytes, executed_bytes, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -507,7 +585,7 @@ class Ledger:
 
     def execution_items(self, run_id: str) -> List[Dict[str, object]]:
         return [dict(row) for row in self.connection.execute(
-            "SELECT operation, classification, path, size, message FROM execution_items WHERE run_id=? ORDER BY item_id", (run_id,)
+            "SELECT operation, classification, path, size, checksum, message FROM execution_items WHERE run_id=? ORDER BY item_id", (run_id,)
         ).fetchall()]
 
     def reconciliation_items(self, run_id: str) -> List[Dict[str, object]]:
@@ -520,6 +598,68 @@ class Ledger:
             """SELECT path, method, status, bytes_verified, source_checksum,
                       destination_checksum, detail FROM verification_items
                WHERE run_id=? ORDER BY item_id""", (run_id,)
+        ).fetchall()]
+
+    def historical_versions(self, relative_path: str) -> List[Dict[str, object]]:
+        """Return ledger-backed archive evidence newest first."""
+        checksum_column = "ei.checksum" if self.schema_version >= 5 else "NULL AS checksum"
+        rows = self.connection.execute(
+            f"""SELECT r.run_id, r.started_at, r.completed_at, r.status,
+                      e.history_path, ei.path, ei.size, ei.classification,
+                      p.category AS plan_category, {checksum_column}
+               FROM execution_items ei
+               JOIN executions e ON e.run_id=ei.run_id
+               JOIN runs r ON r.run_id=ei.run_id
+               LEFT JOIN plan_items p ON p.run_id=e.plan_run_id
+                    AND (p.path=ei.path OR p.related_path=ei.path)
+                    AND p.category IN ('changed_file','delete_from_current','rename_move_candidate')
+               WHERE ei.operation='archive' AND ei.classification!='deleted'
+                 AND ei.path=?
+               ORDER BY COALESCE(r.completed_at, r.started_at) DESC, ei.item_id DESC""",
+            (relative_path,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def current_version(self, relative_path: str) -> Optional[Dict[str, object]]:
+        row = self.connection.execute(
+            """SELECT relative_path, size, checksum, promoted_by_run_id
+               FROM known_good_files WHERE relative_path=?""",
+            (relative_path,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def start_restore(self, restore_id: str, started_at: str, relative_path: str,
+                      source_run_id: str, historical_source_path: str,
+                      destination_path: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO restore_runs
+                   (restore_id, started_at, status, relative_path, source_run_id,
+                    historical_source_path, destination_path)
+                   VALUES (?, ?, 'running', ?, ?, ?, ?)""",
+                (restore_id, started_at, relative_path, source_run_id,
+                 historical_source_path, destination_path),
+            )
+
+    def finish_restore(self, restore_id: str, completed_at: str, *, status: str,
+                       bytes_copied: int = 0, verification_method: Optional[str] = None,
+                       checksum: Optional[str] = None, error: Optional[str] = None) -> None:
+        if status not in {"success", "failed"}:
+            raise LedgerError(f"invalid restore status: {status}")
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE restore_runs SET completed_at=?, status=?, bytes=?,
+                   verification_method=?, checksum=?, error=?
+                   WHERE restore_id=? AND status='running'""",
+                (completed_at, status, bytes_copied, verification_method,
+                 checksum, error, restore_id),
+            )
+            if cursor.rowcount != 1:
+                raise LedgerError(f"restore is not active: {restore_id}")
+
+    def restore_history(self) -> List[Dict[str, object]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM restore_runs ORDER BY started_at DESC"
         ).fetchall()]
 
     def stage_files(self, run_id: str, files: Iterable[FileMetadata]) -> None:
