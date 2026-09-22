@@ -15,6 +15,7 @@ from gorbackup.locking import LockError
 from gorbackup.planner import PlanError, create_plan
 from gorbackup.preflight import PreflightError, run_preflight
 from gorbackup.safety import SafetyError
+from gorbackup.verification import VerificationError, verify_selected
 
 COMMANDS = (
     "backup",
@@ -80,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="manually accept overridable volume anomalies (interactive terminal only)",
             )
+        if command == "verify":
+            subparser.add_argument(
+                "paths", nargs="+", metavar="PATH",
+                help="relative source file or directory (directories are recursive)",
+            )
     return parser
 
 
@@ -89,7 +95,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config = load_config(args.config)
         rclone = check_rclone()
         preflight = None
-        if args.command in {"backup", "baseline", "scan", "plan"}:
+        if args.command in {"backup", "baseline", "scan", "plan", "verify"}:
             baseline = (
                 load_baseline_summary(config)
                 if args.command in {"scan", "plan"}
@@ -117,6 +123,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             scan_result = scan_catalogue(config)
         if args.command == "plan":
             plan_result = create_plan(config, rclone)
+        if args.command == "verify":
+            verification_result = verify_selected(
+                config.source.path,
+                config.archive.root / config.archive.current_dir,
+                args.paths,
+            )
     except (
         ConfigError,
         DependencyError,
@@ -127,6 +139,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         BackupError,
         SafetyError,
         LockError,
+        VerificationError,
     ) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
@@ -148,6 +161,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"executed_transfer_bytes={backup_result.executed_transfer_bytes}; "
             f"executed_archive_files={backup_result.executed_archive_files}; "
             f"executed_archive_bytes={backup_result.executed_archive_bytes}; "
+            f"verified_files={backup_result.verification.verified_files}; "
+            f"verified_bytes={backup_result.verification.verified_bytes}; "
+            f"verification_failures={backup_result.verification.failures}; "
             f"delete_count={backup_result.safety.delete_count}; "
             f"delete_bytes={backup_result.safety.delete_bytes}; "
             f"projected_free_percent="
@@ -192,6 +208,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"errors={plan_result.counts['error']}; manifest={plan_result.manifest_path}"
         )
         return 0 if plan_result.status == "success" else 2
+
+    if args.command == "verify":
+        for item in verification_result.items:
+            print(
+                f"{item.status}: {item.path}; method={item.method}; "
+                f"bytes_verified={item.bytes_verified}; detail={item.detail}"
+            )
+        print(
+            f"verify: {'success' if not verification_result.failures else 'failed'}; "
+            f"verified_files={verification_result.verified_files}; "
+            f"verified_bytes={verification_result.verified_bytes}; "
+            f"failures={verification_result.failures}"
+        )
+        return 0 if not verification_result.failures else 2
 
     version = ".".join(str(part) for part in rclone.version)
     print(

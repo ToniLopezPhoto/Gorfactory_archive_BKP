@@ -75,11 +75,22 @@ under a unique history directory:
 gorbackup --config config/config.yaml backup
 ```
 
-The real run records independent machine-readable execution evidence and
-reconciles it path by path against the immutable plan. It also holds an atomic
+The real run records independent machine-readable execution evidence,
+reconciles it path by path against the immutable plan, and SHA-256 verifies only
+the files actually transferred before success or known-good promotion. It holds an atomic
 single-run lock throughout planning and execution, and reports recently modified
 regular files explicitly without treating them as backed up. See
 [docs/backup.md](docs/backup.md) for execution, divergence, and recovery semantics.
+
+To recheck one explicitly selected file or directory recursively without changing
+either side or the ledger:
+
+```sh
+gorbackup --config config/config.yaml verify project/photo.tif
+```
+
+The path must be relative; omitting it is an error so a multi-terabyte full scan
+cannot start accidentally. See [docs/backup.md](docs/backup.md#manual-selected-path-verification).
 
 ## Development
 

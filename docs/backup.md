@@ -3,14 +3,15 @@
 After CLI preflight, `gorbackup backup` atomically acquires
 `<archive>/state/backup.lock`, creates a fresh immutable plan, applies the safety gates below,
 persists the assessment, reserves a unique history directory, and only then runs
-real rclone.
+real rclone. After reconciling the real execution, it verifies every transferred
+file cryptographically before publishing the manifest or promoting known-good.
 Displaced files are directed to `history/<backup-run-id>/`; the source marker and
 recent-file window remain excluded. Tests and CI use only synthetic temporary
 trees and fake rclone reports.
 
 ## Single-run lock
 
-The lock is held from before planning until execution, reconciliation, manifest
+The lock is held from before planning until execution, reconciliation, verification, manifest
 publication, and known-good promotion have finished. It is released by a context
 manager on success, a safety block, rclone/reconciliation failure, manifest
 failure, or an unexpected exception. Thus two `backup` processes cannot reach a
@@ -112,9 +113,54 @@ was allowed; `warning` means execution completed with non-fatal divergence;
 reconciliation and is the only state eligible for known-good promotion.
 
 Warnings describe what actually happened and publish a degraded backup manifest,
-but cannot advance known-good state. Failures persist execution and reconciliation
-evidence and do not publish a success backup manifest. Existing history content is
-left for recovery and investigation.
+but cannot advance known-good state. Failures persist execution, reconciliation,
+and verification evidence and publish a failed diagnostic manifest, never a
+success manifest. Existing `current/` and history content is left untouched for
+recovery and investigation; this stage performs no destructive rollback.
+
+## Post-transfer verification
+
+`backup: success` means rclone completed, execution exactly matched the immutable
+plan, and every `operation=transfer` row persisted for this real run was verified.
+Only those actual new/replaced files are read. Planned-but-not-transferred,
+`skipped_recent`, unchanged files, and the rest of the multi-terabyte catalogue
+are not rehashed, so daily cost scales with transferred bytes rather than archive
+size.
+
+For the current mounted-filesystem deployment, verification checks existence and
+size, then streams source and `current/` through SHA-256 in bounded chunks. Size
+and mtime are never accepted as content proof. Results are stored per path in
+SQLite and in `verification-<run-id>.json`; the backup manifest contains method,
+verified file/byte totals, failure count, and the report path. A mismatch, missing
+file, read error, or unverifiable path makes the run `failed`, returns non-zero,
+and prevents known-good promotion.
+
+Source metadata from the immutable plan is checked before hashing, and source
+identity/size/mtime are checked again after reading. A source that changed after
+transfer or during hashing is classified `source_changed`, not mislabeled as
+destination corruption, but still cannot be promoted as verified. Destination
+changes during hashing are likewise rejected. The backup lock remains held for
+this entire decision.
+
+Verified transfers write `sha256:<digest>` into `known_good_files`. Checksums for
+unchanged protected files are retained when their size and mtime still match;
+the prior metadata and checksum for `skipped_recent` remain intact.
+
+## Manual selected-path verification
+
+The read-only command compares explicitly selected source paths with
+`archive/current`; directory arguments recurse through regular files:
+
+```sh
+gorbackup --config config/config.yaml verify project/photo.tif
+gorbackup --config config/config.yaml verify project/session-2026
+```
+
+At least one relative path is mandatory, preventing an accidental full-catalogue
+hash. Absolute paths, `..`, root escapes, and symlink escapes fail closed. Exit
+status is zero only when all selected files match; mismatch, absence, unsafe path,
+or read error is non-zero. This command does not update source, `current/`, the
+ledger, or known-good state.
 
 ```sh
 gorbackup --config config/config.yaml backup

@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from gorbackup.config import AppConfig
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class LedgerError(RuntimeError):
@@ -150,6 +150,17 @@ CREATE TABLE reconciliation_items (
     executed_bytes INTEGER,
     detail TEXT NOT NULL
 );
+CREATE TABLE verification_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES executions(run_id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    method TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('verified', 'mismatch', 'source_changed', 'error')),
+    bytes_verified INTEGER NOT NULL,
+    source_checksum TEXT,
+    destination_checksum TEXT,
+    detail TEXT NOT NULL
+);
 CREATE TABLE known_good_files (
     relative_path TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
@@ -169,11 +180,12 @@ CREATE INDEX idx_runs_status_completed ON runs(status, completed_at DESC);
 CREATE INDEX idx_plan_items_run_category ON plan_items(run_id, category);
 CREATE INDEX idx_execution_items_run_operation ON execution_items(run_id, operation);
 CREATE INDEX idx_reconciliation_items_run ON reconciliation_items(run_id);
-PRAGMA user_version = 3;
+CREATE INDEX idx_verification_items_run_status ON verification_items(run_id, status);
+PRAGMA user_version = 4;
 """
 
 _V1_TABLES = (
-    "safety_assessments", "reconciliation_items", "execution_items", "executions",
+    "safety_assessments", "verification_items", "reconciliation_items", "execution_items", "executions",
     "known_good_state", "known_good_files", "plan_catalogue_files", "catalogue_changes",
     "staged_catalogue_files", "catalogue_files", "backup_runs", "file_changes",
     "current_files", "staged_files", "plan_items", "plans", "runs",
@@ -226,9 +238,9 @@ class Ledger:
         has_runs = self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
         ).fetchone()
-        if version not in (0, 1, 2, SCHEMA_VERSION):
+        if version not in (0, 1, 2, 3, SCHEMA_VERSION):
             raise LedgerError(f"unsupported ledger schema version: {version}")
-        if version in (1, 2) or (version == 0 and has_runs):
+        if version in (1, 2, 3) or (version == 0 and has_runs):
             self._migrate_v1()
         elif not has_runs:
             self.connection.executescript(SCHEMA)
@@ -304,22 +316,15 @@ class Ledger:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def complete_execution(self, run_id: str, plan_run_id: str, completed_at: str,
-                           status: str, history_path: str, report_path: str,
-                           execution_items: Sequence[Dict[str, object]],
-                           divergences: Sequence[Dict[str, object]],
-                           warnings: Sequence[str], errors: Sequence[str]) -> None:
-        if status not in {"success", "warning", "failed"}:
-            raise LedgerError(f"invalid execution status: {status}")
-        reconciliation = "exact" if status == "success" else "failed" if status == "failed" else "diverged"
-        transfers = [item for item in execution_items if item["operation"] == "transfer"]
-        archives = [item for item in execution_items if item["operation"] == "archive"]
-        plan = self.connection.execute(
-            "SELECT catalogue_file_count, catalogue_total_bytes, planned_transfer_files, planned_transfer_bytes, planned_archive_files, planned_archive_bytes FROM runs WHERE run_id=? AND operation='plan'",
-            (plan_run_id,),
-        ).fetchone()
-        if plan is None:
-            raise LedgerError(f"plan does not exist: {plan_run_id}")
+    def record_execution_evidence(self, run_id: str, plan_run_id: str,
+                                  history_path: str, report_path: str,
+                                  execution_items: Sequence[Dict[str, object]],
+                                  divergences: Sequence[Dict[str, object]]) -> None:
+        """Persist immutable rclone/reconciliation evidence before verification."""
+        reconciliation = (
+            "failed" if any(item["severity"] == "failure" for item in divergences)
+            else "diverged" if divergences else "exact"
+        )
         with self.connection:
             self.connection.execute(
                 "INSERT INTO executions (run_id, plan_run_id, history_path, report_path, reconciliation_status) VALUES (?, ?, ?, ?, ?)",
@@ -333,13 +338,49 @@ class Ledger:
                 "INSERT INTO reconciliation_items (run_id, severity, divergence_type, operation, path, planned_bytes, executed_bytes, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 ((run_id, item["severity"], item["divergence_type"], item["operation"], item["path"], item.get("planned_bytes"), item.get("executed_bytes"), item["detail"]) for item in divergences),
             )
+
+    def finalize_execution(self, run_id: str, completed_at: str, status: str,
+                           verification_items: Sequence[Dict[str, object]],
+                           warnings: Sequence[str], errors: Sequence[str]) -> None:
+        if status not in {"success", "warning", "failed"}:
+            raise LedgerError(f"invalid execution status: {status}")
+        execution = self.connection.execute(
+            "SELECT plan_run_id FROM executions WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if execution is None:
+            raise LedgerError(f"execution evidence does not exist: {run_id}")
+        plan = self.connection.execute(
+            "SELECT catalogue_file_count, catalogue_total_bytes, planned_transfer_files, planned_transfer_bytes, planned_archive_files, planned_archive_bytes FROM runs WHERE run_id=? AND operation='plan'",
+            (execution["plan_run_id"],),
+        ).fetchone()
+        if plan is None:
+            raise LedgerError(f"plan does not exist: {execution['plan_run_id']}")
+        transfers = self.connection.execute(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM execution_items WHERE run_id=? AND operation='transfer'",
+            (run_id,),
+        ).fetchone()
+        archives = self.connection.execute(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM execution_items WHERE run_id=? AND operation='archive'",
+            (run_id,),
+        ).fetchone()
+        with self.connection:
+            self.connection.executemany(
+                """INSERT INTO verification_items
+                   (run_id, path, method, status, bytes_verified,
+                    source_checksum, destination_checksum, detail)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                ((run_id, item["path"], item["method"], item["status"],
+                  item["bytes_verified"], item.get("source_checksum"),
+                  item.get("destination_checksum"), item["detail"])
+                 for item in verification_items),
+            )
             cursor = self.connection.execute(
                 """UPDATE runs SET completed_at=?, status=?, catalogue_file_count=?, catalogue_total_bytes=?,
                    planned_transfer_files=?, planned_transfer_bytes=?, planned_archive_files=?, planned_archive_bytes=?,
                    executed_transfer_files=?, executed_transfer_bytes=?, executed_archive_files=?, executed_archive_bytes=?,
                    warnings_json=?, errors_json=? WHERE run_id=? AND status='running'""",
-                (completed_at, status, *tuple(plan), len(transfers), sum(int(i["size"]) for i in transfers),
-                 len(archives), sum(int(i["size"]) for i in archives), json.dumps(list(warnings)),
+                (completed_at, status, *tuple(plan), transfers["count"], transfers["bytes"],
+                 archives["count"], archives["bytes"], json.dumps(list(warnings)),
                  json.dumps(list(errors)), run_id),
             )
             if cursor.rowcount != 1:
@@ -420,6 +461,21 @@ class Ledger:
             )
             if item["relative_path"] not in recent_paths
         }
+        verified_checksums = {
+            item["path"]: f"{item['method']}:{item['source_checksum']}"
+            for item in self.connection.execute(
+                """SELECT path, method, source_checksum FROM verification_items
+                   WHERE run_id=? AND status='verified'""", (run_id,)
+            )
+        }
+        planned = {
+            path: (item[0], item[1], item[2],
+                   verified_checksums.get(path) or item[3]
+                   or (previous.get(path, (None, None, None, None))[3]
+                       if previous.get(path, (None, None, None, None))[1:3] == item[1:3]
+                       else None))
+            for path, item in planned.items()
+        }
         protected = dict(planned)
         for path in recent_paths:
             if path in previous:
@@ -457,6 +513,13 @@ class Ledger:
     def reconciliation_items(self, run_id: str) -> List[Dict[str, object]]:
         return [dict(row) for row in self.connection.execute(
             "SELECT severity, divergence_type, operation, path, planned_bytes, executed_bytes, detail FROM reconciliation_items WHERE run_id=? ORDER BY item_id", (run_id,)
+        ).fetchall()]
+
+    def verification_items(self, run_id: str) -> List[Dict[str, object]]:
+        return [dict(row) for row in self.connection.execute(
+            """SELECT path, method, status, bytes_verified, source_checksum,
+                      destination_checksum, detail FROM verification_items
+               WHERE run_id=? ORDER BY item_id""", (run_id,)
         ).fetchall()]
 
     def stage_files(self, run_id: str, files: Iterable[FileMetadata]) -> None:
