@@ -26,7 +26,9 @@ from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import FileMetadata, Ledger
 from gorbackup.locking import BackupLock, LockError
 from gorbackup.planner import PlanItem, PlanResult
-from gorbackup.renames import BackendCapabilities, RenameCapabilities
+from gorbackup.renames import (
+    BackendCapabilities, RenameCapabilities, RenameStateAmbiguous,
+)
 from gorbackup.safety import GateFailure, SafetyAssessment, SafetyError
 from gorbackup.verification import VerificationItem, VerificationResult
 
@@ -215,6 +217,48 @@ def test_proven_rename_has_zero_transfer_bytes_and_promotes_new_path(tmp_path: P
     with Ledger(config.ledger_path) as ledger:
         assert ledger.current_version(item.related_path) is None
         assert ledger.current_version(item.path)["checksum"].startswith("sha256:")
+
+
+def test_ambiguous_rename_fails_run_and_retains_journal(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    source = config.source.path / "new.tif"
+    old = config.archive.root / "current" / "old.tif"
+    source.write_bytes(b"pixels"); old.write_bytes(b"pixels")
+    stat = source.stat()
+    item = PlanItem("rename_move_candidate", "new.tif", 6, "candidate", "old.tif", 6)
+    counts = {name: int(name == "rename_move_candidate") for name in (
+        "new_file", "changed_file", "delete_from_current",
+        "rename_move_candidate", "skipped_recent", "error",
+    )}
+    totals = {name: (6 if name == "rename_move_candidate" else 0) for name in counts}
+    plan = PlanResult("ambiguous-plan", "success", (item,), counts, totals, 1, 6,
+                      0, 0, 0, 0, config.manifests_root / "plan.json", 1, 6)
+    with Ledger(config.ledger_path) as ledger:
+        ledger.start_run("ambiguous-plan", FIXED_TIME.isoformat(), "source-id", "archive-id", "plan")
+        ledger.save_plan(
+            "ambiguous-plan", FIXED_TIME.isoformat(), "success",
+            [{"category": item.category, "path": item.path, "related_path": item.related_path,
+              "size": 6, "leaving_size": 6, "reason": item.reason}],
+            counts, totals, [], [], [FileMetadata("new.tif", 6, stat.st_mtime_ns)],
+        )
+    local = BackendCapabilities("local", frozenset({"sha1"}), True, True)
+    capabilities = RenameCapabilities(local, local, frozenset({"sha1"}), True)
+
+    with pytest.raises(BackupError, match="journal retained"):
+        run_backup(
+            config, RcloneInfo("rclone", (1, 70, 0)),
+            planner=lambda *args, **kwargs: plan,
+            safety_checker=lambda *args, **kwargs: APPROVED,
+            capability_prober=lambda *args, **kwargs: capabilities,
+            rename_executor=lambda *args: (_ for _ in ()).throw(
+                RenameStateAmbiguous("unknown post-state")
+            ),
+            now=lambda: FIXED_TIME, run_id_factory=lambda: "ambiguous-run",
+        )
+    assert (config.state_root / ".rename-journal-ambiguous-run.json").exists()
+    with Ledger(config.ledger_path) as ledger:
+        run = next(row for row in ledger.run_history() if row["run_id"] == "ambiguous-run")
+        assert run["status"] == "failed"
 
 
 def test_real_verification_promotes_checksums_and_persists_evidence(tmp_path: Path) -> None:
