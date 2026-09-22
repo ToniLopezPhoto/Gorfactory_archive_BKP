@@ -5,7 +5,7 @@ import os
 import subprocess
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -23,6 +23,7 @@ from gorbackup.safety import (
     SafetyReference,
     assess_plan_safety,
 )
+from gorbackup.verification import ExpectedSource, VerificationResult, verify_transfers
 
 
 class BackupError(RuntimeError):
@@ -63,6 +64,10 @@ class BackupResult:
     report_path: Path
     manifest_path: Path
     divergences: Tuple[Divergence, ...]
+    verification: VerificationResult = field(
+        default_factory=lambda: VerificationResult("sha256", ())
+    )
+    verification_report_path: Path = Path("")
 
     # Transitional API aliases; their meaning is always executed, never planned.
     @property
@@ -256,7 +261,8 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
                safety_checker: Callable[..., SafetyAssessment] = assess_plan_safety,
                override_safety: bool = False,
                manual_context: bool = False,
-               lock_factory: Callable[..., BackupLock] = BackupLock) -> BackupResult:
+               lock_factory: Callable[..., BackupLock] = BackupLock,
+               verifier: Callable[..., VerificationResult] = verify_transfers) -> BackupResult:
     """Run planning through persistence while holding exclusive backup ownership."""
     validate_state_location(config)
     lock = lock_factory(
@@ -269,7 +275,7 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
             config, rclone, runner=runner, now=now,
             run_id_factory=run_id_factory, planner=planner,
             safety_checker=safety_checker, override_safety=override_safety,
-            manual_context=manual_context,
+            manual_context=manual_context, verifier=verifier,
         )
 
 
@@ -280,7 +286,8 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
                        planner: Callable[..., PlanResult],
                        safety_checker: Callable[..., SafetyAssessment],
                        override_safety: bool,
-                       manual_context: bool) -> BackupResult:
+                       manual_context: bool,
+                       verifier: Callable[..., VerificationResult]) -> BackupResult:
     if override_safety and not manual_context:
         raise BackupError("--override-safety requires an interactive manual session")
     plan = planner(config, rclone, runner=runner, now=now)
@@ -347,6 +354,7 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
     os.close(descriptor)
     log_path = Path(log_name)
     report_path = config.manifests_root / f"execution-{run_id}.json"
+    verification_report_path = config.manifests_root / f"verification-{run_id}.json"
     command = [
         rclone.executable, "sync", str(config.source.path), str(current),
         "--use-json-log", "--log-level", "INFO", "--log-file", str(log_path),
@@ -371,20 +379,52 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
             divergences = reconcile_execution(plan, executed) + audit_history(history_path, executed)
             errors = list(log_errors) + [item.detail for item in divergences if item.severity == "failure"]
             warnings = list(log_warnings) + [item.detail for item in divergences if item.severity == "warning"]
+            ledger.record_execution_evidence(
+                run_id, plan.run_id, str(history_path), str(report_path),
+                [asdict(item) for item in executed], [asdict(item) for item in divergences],
+            )
+            # Read back the durable execution evidence: planned-only paths are
+            # deliberately incapable of entering the verification scope.
+            actual_items = ledger.execution_items(run_id)
+            expected_sources = {
+                row["relative_path"]: ExpectedSource(row["size"], row["mtime_ns"])
+                for row in ledger.connection.execute(
+                    "SELECT relative_path, size, mtime_ns FROM plan_catalogue_files WHERE run_id=?",
+                    (plan.run_id,),
+                )
+            }
+            verification = verifier(
+                config.source.path, current, actual_items,
+                expected_sources=expected_sources,
+            )
+            verification_errors = [
+                f"verification_{item.status}: {item.path}: {item.detail}"
+                for item in verification.items if item.status != "verified"
+            ]
+            errors.extend(verification_errors)
             status = "failed" if completed.returncode != 0 or errors else "warning" if warnings else "success"
             completed_at = now()
+            verification_payload = {
+                "schema_version": 1, "run_id": run_id,
+                "method": verification.method,
+                "verified_files": verification.verified_files,
+                "verified_bytes": verification.verified_bytes,
+                "verification_failures": verification.failures,
+                "items": [asdict(item) for item in verification.items],
+            }
+            _atomic_json(verification_report_path, verification_payload)
             report = {
-                "schema_version": 2, "run_id": run_id, "plan_run_id": plan.run_id,
+                "schema_version": 3, "run_id": run_id, "plan_run_id": plan.run_id,
                 "status": status, "started_at": started_at.isoformat(), "completed_at": completed_at.isoformat(),
                 "items": [asdict(item) for item in executed],
                 "divergences": [asdict(item) for item in divergences],
+                "verification_report": str(verification_report_path),
                 "warnings": warnings, "errors": errors,
             }
             _atomic_json(report_path, report)
-            ledger.complete_execution(
-                run_id, plan.run_id, completed_at.isoformat(), status, str(history_path),
-                str(report_path), [asdict(item) for item in executed],
-                [asdict(item) for item in divergences], warnings, errors,
+            ledger.finalize_execution(
+                run_id, completed_at.isoformat(), status,
+                [asdict(item) for item in verification.items], warnings, errors,
             )
         except Exception as exc:
             ledger.fail_run(run_id, now().isoformat(), str(exc))
@@ -395,13 +435,11 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
             if log_path.exists():
                 log_path.unlink()
 
-    if status == "failed":
-        raise BackupError("backup execution could not be reconciled; see " + str(report_path))
     transfers = [item for item in executed if item.operation == "transfer"]
     archives = [item for item in executed if item.operation == "archive"]
     manifest_path = config.manifests_root / f"backup-{run_id}.json"
     payload = {
-        "schema_version": 2, "run_id": run_id, "plan_run_id": plan.run_id, "status": status,
+        "schema_version": 3, "run_id": run_id, "plan_run_id": plan.run_id, "status": status,
         "started_at": started_at.isoformat(), "completed_at": completed_at.isoformat(),
         "history_path": str(history_path), "execution_report": str(report_path),
         "catalogue_file_count": plan.catalogue_file_count, "catalogue_total_bytes": plan.catalogue_total_bytes,
@@ -409,6 +447,11 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
         "planned_archive_files": plan.planned_archive_files, "planned_archive_bytes": plan.planned_archive_bytes,
         "executed_transfer_files": len(transfers), "executed_transfer_bytes": sum(i.size for i in transfers),
         "executed_archive_files": len(archives), "executed_archive_bytes": sum(i.size for i in archives),
+        "verification_method": verification.method,
+        "verified_files": verification.verified_files,
+        "verified_bytes": verification.verified_bytes,
+        "verification_failures": verification.failures,
+        "verification_report": str(verification_report_path),
         "warnings": warnings, "divergences": [asdict(item) for item in divergences], "safety": asdict(safety),
     }
     try:
@@ -421,6 +464,11 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
     if status == "success":
         with Ledger(config.ledger_path) as ledger:
             ledger.promote_known_good(run_id)
+    if status == "failed":
+        raise BackupError(
+            "backup execution or verification failed; see " + str(report_path)
+        )
     return BackupResult(run_id, plan.run_id, status, len(transfers), sum(i.size for i in transfers),
                         len(archives), sum(i.size for i in archives), safety, history_path,
-                        report_path, manifest_path, divergences)
+                        report_path, manifest_path, divergences, verification,
+                        verification_report_path)

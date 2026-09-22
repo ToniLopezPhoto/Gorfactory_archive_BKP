@@ -180,7 +180,7 @@ def test_v1_ledger_is_migrated_to_clean_unambiguous_schema(tmp_path: Path) -> No
             row["name"]
             for row in ledger.connection.execute("PRAGMA table_info(runs)").fetchall()
         }
-        assert ledger.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert ledger.connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert "catalogue_file_count" in columns
         assert "planned_transfer_bytes" in columns
         assert "executed_archive_bytes" in columns

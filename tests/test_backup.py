@@ -27,9 +27,21 @@ from gorbackup.ledger import FileMetadata, Ledger
 from gorbackup.locking import BackupLock, LockError
 from gorbackup.planner import PlanItem, PlanResult
 from gorbackup.safety import GateFailure, SafetyAssessment, SafetyError
+from gorbackup.verification import VerificationItem, VerificationResult
 
 FIXED_TIME = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
 APPROVED = SafetyAssessment(1, 5, 10, 100, 90, 90.0)
+
+
+def successful_verifier(source, destination, transfers, **kwargs):
+    items = tuple(
+        VerificationItem(
+            item["path"], "sha256", "verified", item["size"],
+            "digest", "digest", "checksums match",
+        )
+        for item in transfers if item["operation"] == "transfer"
+    )
+    return VerificationResult("sha256", items)
 
 
 def rejected_assessment() -> SafetyAssessment:
@@ -111,6 +123,95 @@ def seed_plan(config: AppConfig) -> None:
         )
 
 
+def prepare_transfer_files(config: AppConfig) -> None:
+    source_values = {
+        "new.tif": b"new",
+        "changed.tif": b"changed",
+        "stable.tif": b"still",
+    }
+    for name, value in source_values.items():
+        (config.source.path / name).write_bytes(value)
+    with Ledger(config.ledger_path) as ledger, ledger.connection:
+        for name in source_values:
+            stat = (config.source.path / name).stat()
+            ledger.connection.execute(
+                """UPDATE plan_catalogue_files SET size=?, mtime_ns=?
+                   WHERE run_id='plan-1' AND relative_path=?""",
+                (stat.st_size, stat.st_mtime_ns, name),
+            )
+
+
+def real_transfer_runner(config: AppConfig, *, corrupt: bool = False):
+    def runner(command, **kwargs):
+        history = Path(command[command.index("--backup-dir") + 1])
+        current = config.archive.root / config.archive.current_dir
+        (history / "changed.tif").write_bytes(b"old!")
+        (history / "old.tif").write_bytes(b"older")
+        (current / "new.tif").write_bytes(b"new" if not corrupt else b"NEW")
+        (current / "changed.tif").write_bytes(b"changed")
+        Path(command[command.index("--log-file") + 1]).write_text(
+            '{"level":"info","msg":"Copied (new)","object":"new.tif","size":3}\n'
+            '{"level":"info","msg":"Moved","object":"changed.tif","size":4}\n'
+            '{"level":"info","msg":"Copied (replaced)","object":"changed.tif","size":7}\n'
+            '{"level":"info","msg":"Moved","object":"old.tif","size":5}\n',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+    return runner
+
+
+def test_real_verification_promotes_checksums_and_persists_evidence(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    seed_plan(config)
+    prepare_transfer_files(config)
+
+    result = run_backup(
+        config, RcloneInfo("rclone", (1, 70, 0)),
+        runner=real_transfer_runner(config), now=lambda: FIXED_TIME,
+        run_id_factory=lambda: "verified-run",
+        planner=lambda *args, **kwargs: successful_plan(config),
+        safety_checker=lambda *args, **kwargs: APPROVED,
+    )
+
+    assert result.status == "success"
+    assert result.verification.verified_files == 2
+    assert result.verification.verified_bytes == 10
+    with Ledger(config.ledger_path) as ledger:
+        assert [item["status"] for item in ledger.verification_items("verified-run")] == [
+            "verified", "verified"
+        ]
+        checksums = {
+            row["relative_path"]: row["checksum"]
+            for row in ledger.connection.execute(
+                "SELECT relative_path, checksum FROM known_good_files"
+            )
+        }
+        assert checksums["new.tif"].startswith("sha256:")
+        assert checksums["changed.tif"].startswith("sha256:")
+
+
+def test_corrupt_destination_fails_run_and_does_not_promote(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    seed_plan(config)
+    prepare_transfer_files(config)
+
+    with pytest.raises(BackupError, match="verification failed"):
+        run_backup(
+            config, RcloneInfo("rclone", (1, 70, 0)),
+            runner=real_transfer_runner(config, corrupt=True), now=lambda: FIXED_TIME,
+            run_id_factory=lambda: "corrupt-run",
+            planner=lambda *args, **kwargs: successful_plan(config),
+            safety_checker=lambda *args, **kwargs: APPROVED,
+        )
+
+    with Ledger(config.ledger_path) as ledger:
+        run = next(row for row in ledger.run_history() if row["run_id"] == "corrupt-run")
+        assert run["status"] == "failed"
+        assert ledger.known_good_state() is None
+        statuses = {item["path"]: item["status"] for item in ledger.verification_items("corrupt-run")}
+        assert statuses == {"new.tif": "mismatch", "changed.tif": "verified"}
+
+
 def test_backup_executes_sync_with_unique_versioned_history(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     seed_plan(config)
@@ -138,6 +239,7 @@ def test_backup_executes_sync_with_unique_versioned_history(tmp_path: Path) -> N
         run_id_factory=lambda: "backup-1",
         planner=lambda *args, **kwargs: successful_plan(config),
         safety_checker=lambda *args, **kwargs: APPROVED,
+        verifier=successful_verifier,
     )
 
     command = commands[0]
@@ -176,7 +278,7 @@ def test_backup_failure_is_recorded_and_has_no_success_manifest(tmp_path: Path) 
         )
         return subprocess.CompletedProcess(command, 1, "", "")
 
-    with pytest.raises(BackupError, match="could not be reconciled"):
+    with pytest.raises(BackupError, match="execution or verification failed"):
         run_backup(
             config,
             RcloneInfo("rclone", (1, 70, 0)),
@@ -185,9 +287,12 @@ def test_backup_failure_is_recorded_and_has_no_success_manifest(tmp_path: Path) 
             run_id_factory=lambda: "backup-failed",
             planner=lambda *args, **kwargs: successful_plan(config),
             safety_checker=lambda *args, **kwargs: APPROVED,
+            verifier=successful_verifier,
         )
 
-    assert not (config.manifests_root / "backup-backup-failed.json").exists()
+    assert json.loads(
+        (config.manifests_root / "backup-backup-failed.json").read_text()
+    )["status"] == "failed"
     with Ledger(config.ledger_path) as ledger:
         run = next(
             item for item in ledger.run_history()
@@ -276,7 +381,7 @@ def test_recent_metadata_does_not_replace_last_protected_version(tmp_path: Path)
                 "VALUES ('plan-1', 'skipped_recent', 'stable.tif', 5, 0, 'recent')"
             )
             ledger.connection.execute(
-                "INSERT INTO known_good_files VALUES ('stable.tif', 4, 0, NULL, 'plan-1')"
+                "INSERT INTO known_good_files VALUES ('stable.tif', 4, 0, 'sha256:old', 'plan-1')"
             )
             ledger.connection.execute(
                 "INSERT INTO known_good_state VALUES (1, 'plan-1', 1, 4, ?)",
@@ -316,15 +421,57 @@ def test_recent_metadata_does_not_replace_last_protected_version(tmp_path: Path)
         now=lambda: FIXED_TIME, run_id_factory=lambda: "backup-recent",
         planner=lambda *args, **kwargs: plan,
         safety_checker=lambda *args, **kwargs: APPROVED,
+        verifier=successful_verifier,
     )
     with Ledger(config.ledger_path) as ledger:
         row = ledger.connection.execute(
-            "SELECT size, mtime_ns FROM known_good_files WHERE relative_path='stable.tif'"
+            "SELECT size, mtime_ns, checksum FROM known_good_files WHERE relative_path='stable.tif'"
         ).fetchone()
-        assert tuple(row) == (4, 0)
+        assert tuple(row) == (4, 0, "sha256:old")
         state = ledger.known_good_state()
         assert state["catalogue_file_count"] == 3
         assert state["catalogue_total_bytes"] == 14
+
+
+def test_unchanged_known_good_checksum_is_preserved(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    seed_plan(config)
+    with Ledger(config.ledger_path) as ledger, ledger.connection:
+        ledger.connection.execute(
+            "INSERT INTO known_good_files VALUES "
+            "('stable.tif', 5, 1, 'sha256:stable', 'plan-1')"
+        )
+        ledger.connection.execute(
+            "INSERT INTO known_good_state VALUES (1, 'plan-1', 1, 5, ?)",
+            (FIXED_TIME.isoformat(),),
+        )
+
+    def runner(command, **kwargs):
+        history = Path(command[command.index("--backup-dir") + 1])
+        (history / "changed.tif").write_bytes(b"old!")
+        (history / "old.tif").write_bytes(b"older")
+        Path(command[command.index("--log-file") + 1]).write_text(
+            '{"level":"info","msg":"Copied (new)","object":"new.tif","size":3}\n'
+            '{"level":"info","msg":"Moved","object":"changed.tif","size":4}\n'
+            '{"level":"info","msg":"Copied (replaced)","object":"changed.tif","size":7}\n'
+            '{"level":"info","msg":"Moved","object":"old.tif","size":5}\n',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    run_backup(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "checksum-preserved",
+        planner=lambda *args, **kwargs: successful_plan(config),
+        safety_checker=lambda *args, **kwargs: APPROVED,
+        verifier=successful_verifier,
+    )
+
+    with Ledger(config.ledger_path) as ledger:
+        checksum = ledger.connection.execute(
+            "SELECT checksum FROM known_good_files WHERE relative_path='stable.tif'"
+        ).fetchone()["checksum"]
+        assert checksum == "sha256:stable"
 
 
 def test_skipped_recent_is_not_expected_execution_or_divergence(tmp_path: Path) -> None:
@@ -374,6 +521,7 @@ def test_recent_mutation_during_real_planning_preserves_known_good(tmp_path: Pat
         config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
         now=lambda: FIXED_TIME, run_id_factory=lambda: "backup-live-recent",
         safety_checker=lambda *args, **kwargs: APPROVED,
+        verifier=successful_verifier,
     )
     assert result.status == "success"
     live_command = next(command for command in commands if "--dry-run" not in command)
@@ -476,6 +624,7 @@ def test_warning_run_does_not_advance_known_good_state(tmp_path: Path) -> None:
         now=lambda: FIXED_TIME, run_id_factory=lambda: "warning-run",
         planner=lambda *args, **kwargs: successful_plan(config),
         safety_checker=lambda *args, **kwargs: APPROVED,
+        verifier=successful_verifier,
     )
 
     assert result.status == "warning"
@@ -509,6 +658,7 @@ def test_manual_override_is_audited_and_allows_only_volume_gate(tmp_path: Path) 
         now=lambda: FIXED_TIME, run_id_factory=lambda: "overridden",
         planner=lambda *args, **kwargs: successful_plan(config),
         safety_checker=reject, override_safety=True, manual_context=True,
+        verifier=successful_verifier,
     )
 
     assert result.status == "success"
@@ -587,6 +737,7 @@ def test_successful_run_after_blocked_run_promotes_known_good(tmp_path: Path) ->
         now=lambda: FIXED_TIME, run_id_factory=lambda: "then-success",
         planner=lambda *args, **kwargs: successful_plan(config),
         safety_checker=lambda *args, **kwargs: APPROVED,
+        verifier=successful_verifier,
     )
     assert result.status == "success"
     with Ledger(config.ledger_path) as ledger:

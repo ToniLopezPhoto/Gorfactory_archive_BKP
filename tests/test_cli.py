@@ -17,7 +17,7 @@ from gorbackup.safety import SafetyAssessment
     [
         item
         for item in COMMANDS
-        if item not in {"backup", "baseline", "scan", "plan"}
+        if item not in {"backup", "baseline", "scan", "plan", "verify"}
     ],
 )
 def test_placeholder_commands_validate_without_touching_paths(
@@ -253,3 +253,32 @@ def test_failed_plan_returns_nonzero(
 
     assert main(["--config", "unused.yaml", "plan"]) == 2
     assert "errors=1" in capsys.readouterr().out
+
+
+def test_verify_command_returns_success_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    archive = tmp_path / "archive"
+    source.mkdir()
+    (archive / "current").mkdir(parents=True)
+    (source / "photo.tif").write_bytes(b"same")
+    (archive / "current" / "photo.tif").write_bytes(b"same")
+    config = SimpleNamespace(
+        source=SimpleNamespace(path=source),
+        archive=SimpleNamespace(root=archive, current_dir="current"),
+    )
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "gorbackup.cli.check_rclone",
+        lambda: SimpleNamespace(version=(1, 70, 0)),
+    )
+    monkeypatch.setattr("gorbackup.cli.run_preflight", lambda *args, **kwargs: None)
+
+    assert main(["--config", "unused.yaml", "verify", "photo.tif"]) == 0
+    assert "verify: success" in capsys.readouterr().out
+
+    (archive / "current" / "photo.tif").write_bytes(b"oops")
+    assert main(["--config", "unused.yaml", "verify", "photo.tif"]) == 2
+    assert "verify: failed" in capsys.readouterr().out
