@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from gorbackup.config import AppConfig
 from gorbackup.dependencies import RcloneInfo
-from gorbackup.ledger import Ledger, inventory_source, validate_state_location
+from gorbackup.ledger import FileMetadata, Ledger, inventory_source, validate_state_location
 
 CATEGORIES = (
     "new_file",
@@ -61,6 +61,13 @@ class PlanResult:
     @property
     def leaving_current_bytes(self) -> int:
         return self.planned_archive_bytes
+
+
+@dataclass(frozen=True)
+class CatalogueDifference:
+    classification: str
+    path: str
+    metadata: FileMetadata
 
 
 def _utc_now() -> datetime:
@@ -181,6 +188,43 @@ def find_recent_files(
                     )
                 )
     return items
+
+
+def classify_catalogue_differences(
+    before: Sequence[FileMetadata],
+    after: Sequence[FileMetadata],
+    cutoff: datetime,
+) -> Tuple[CatalogueDifference, ...]:
+    """Classify path-level inventory changes without weakening stable checks."""
+    before_by_path = {item.relative_path: item for item in before}
+    after_by_path = {item.relative_path: item for item in after}
+
+    def recent(item: FileMetadata) -> bool:
+        modified = datetime.fromtimestamp(item.mtime_ns / 1_000_000_000, timezone.utc)
+        return modified > cutoff
+
+    differences: List[CatalogueDifference] = []
+    for path in sorted(before_by_path.keys() | after_by_path.keys()):
+        old = before_by_path.get(path)
+        new = after_by_path.get(path)
+        if old == new:
+            continue
+        if old is None:
+            classification = "recent_appearance" if recent(new) else "stable_change"
+            metadata = new
+        elif new is None:
+            classification = "recent_disappearance" if recent(old) else "stable_change"
+            metadata = old
+        elif recent(old) and recent(new):
+            classification = "recent_change"
+            metadata = new
+        else:
+            # A formerly stable file becoming recent is not unequivocally
+            # covered by the grace window; it remains an immutable-plan error.
+            classification = "stable_change"
+            metadata = new
+        differences.append(CatalogueDifference(classification, path, metadata))
+    return tuple(differences)
 
 
 def _classify_rename_candidates(
@@ -334,27 +378,50 @@ def create_plan(
                 inventory_source(config.source.path, config.source.marker_file),
                 key=lambda item: item.relative_path,
             ))
-            if catalogue_files != catalogue_before:
+            cutoff = started - timedelta(minutes=config.safety.ignore_recent_minutes)
+            differences = classify_catalogue_differences(
+                catalogue_before, catalogue_files, cutoff
+            )
+            stable_differences = [
+                item for item in differences if item.classification == "stable_change"
+            ]
+            if stable_differences:
                 items.append(
                     PlanItem(
                         "error",
                         "",
                         0,
-                        "catalogue changed while the immutable plan was being generated",
+                        "catalogue changed while the immutable plan was being generated: "
+                        + ", ".join(item.path for item in stable_differences),
                     )
                 )
-            cutoff = started - timedelta(minutes=config.safety.ignore_recent_minutes)
             recent_items = find_recent_files(
                 config.source.path, config.source.marker_file, cutoff
             )
-            recent_paths = {item.path for item in recent_items}
+            recent_by_path = {item.path: item for item in recent_items}
+            for difference in differences:
+                if difference.classification == "stable_change":
+                    continue
+                reason = {
+                    "recent_change": "recent path changed during planning",
+                    "recent_appearance": "recent path appeared during planning",
+                    "recent_disappearance": "recent path changed/disappeared during planning",
+                }[difference.classification]
+                recent_by_path[difference.path] = PlanItem(
+                    "skipped_recent", difference.path, difference.metadata.size, reason
+                )
+            recent_paths = set(recent_by_path)
             # Do not trust rclone's report to be the sole expression of the
             # grace window.  A recent source path cannot also be actionable.
             items = [
                 item for item in items
-                if item.category == "error" or item.path not in recent_paths
+                if item.path not in recent_paths
+                or (
+                    item.category == "error"
+                    and not item.reason.startswith("cannot size path:")
+                )
             ]
-            items.extend(recent_items)
+            items.extend(recent_by_path[path] for path in sorted(recent_by_path))
             items = _classify_rename_candidates(items, config.source.path, current)
             if completed.returncode != 0 and not log_errors:
                 detail = (completed.stderr or completed.stdout).strip()

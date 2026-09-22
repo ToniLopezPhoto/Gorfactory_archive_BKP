@@ -339,6 +339,56 @@ def test_skipped_recent_is_not_expected_execution_or_divergence(tmp_path: Path) 
     assert reconcile_execution(recent_only, []) == ()
 
 
+def test_recent_mutation_during_real_planning_preserves_known_good(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    source = config.source.path / "photo.tif"
+    source.write_bytes(b"newer")
+    recent_ns = int(FIXED_TIME.timestamp() * 1_000_000_000)
+    os.utime(source, ns=(recent_ns, recent_ns))
+    seed_plan(config)
+    with Ledger(config.ledger_path) as ledger:
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO known_good_files VALUES ('photo.tif', 4, 1, NULL, 'plan-1')"
+            )
+            ledger.connection.execute(
+                "INSERT INTO known_good_state VALUES (1, 'plan-1', 1, 4, ?)",
+                (FIXED_TIME.isoformat(),),
+            )
+
+    commands = []
+
+    def runner(command, **kwargs):
+        commands.append(command)
+        log = Path(command[command.index("--log-file") + 1])
+        if "--dry-run" in command:
+            source.write_bytes(b"newest-version")
+            os.utime(source, ns=(recent_ns + 1_000_000_000, recent_ns + 1_000_000_000))
+            Path(command[command.index("--combined") + 1]).write_text(
+                "+ photo.tif\n", encoding="utf-8"
+            )
+        log.write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = run_backup(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "backup-live-recent",
+        safety_checker=lambda *args, **kwargs: APPROVED,
+    )
+    assert result.status == "success"
+    live_command = next(command for command in commands if "--dry-run" not in command)
+    assert "/photo.tif" in [
+        live_command[index + 1]
+        for index, value in enumerate(live_command)
+        if value == "--exclude"
+    ]
+    with Ledger(config.ledger_path) as ledger:
+        protected = ledger.connection.execute(
+            "SELECT size, mtime_ns FROM known_good_files WHERE relative_path='photo.tif'"
+        ).fetchone()
+        assert tuple(protected) == (4, 1)
+
+
 def test_execution_log_is_machine_readable_and_rejects_ambiguous_events() -> None:
     items, warnings, errors = parse_execution_log([
         '{"level":"info","msg":"Copied (new)","object":"new.tif","size":3}',
