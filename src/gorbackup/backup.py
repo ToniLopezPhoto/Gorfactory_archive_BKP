@@ -25,7 +25,9 @@ from gorbackup.safety import (
 )
 from gorbackup.verification import ExpectedSource, VerificationResult, verify_transfers
 from gorbackup.renames import (
-    RenameCapabilities, execute_local_rename, probe_rename_capabilities, prove_identity,
+    RenameCapabilities, RenameOptimizationUnavailable, RenameStateAmbiguous,
+    execute_local_rename,
+    probe_rename_capabilities, prove_identity,
 )
 
 
@@ -437,9 +439,15 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
             for proven in proven_items:
                 try:
                     rename_executor(current, proven)
-                except OSError:
+                except RenameOptimizationUnavailable:
                     # A race or unsupported move falls back to normal rclone.
                     continue
+                except RenameStateAmbiguous as exc:
+                    with Ledger(config.ledger_path) as ledger:
+                        ledger.fail_run(run_id, now().isoformat(), str(exc))
+                    raise BackupError(
+                        f"optimized rename left ambiguous state; journal retained: {rename_journal}"
+                    ) from exc
                 optimized.append(ExecutionItem(
                     "rename", "optimized_move", proven.new_path, proven.size,
                     "destination-side local rename after stable SHA-256 identity proof",

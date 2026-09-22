@@ -2,6 +2,9 @@
 
 import json
 import os
+import errno
+import ctypes
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -35,6 +38,25 @@ class ProvenRename:
     new_path: str
     size: int
     sha256: str
+    source_path: str
+    source_fingerprint: Tuple[int, int, int, int]
+    old_fingerprint: Tuple[int, int, int, int]
+
+
+class RenameOptimizationUnavailable(RuntimeError):
+    """A guaranteed no-op prevented optimization; normal sync may fall back."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class RenameStateAmbiguous(RuntimeError):
+    """The rename post-state is unsafe to interpret; retain the journal."""
+
+
+def _fingerprint(value: os.stat_result) -> Tuple[int, int, int, int]:
+    return (value.st_size, value.st_mtime_ns, value.st_dev, value.st_ino)
 
 
 def _parse_features(stdout: str) -> BackendCapabilities:
@@ -100,22 +122,134 @@ def prove_identity(source_root: Path, current_root: Path, item: PlanItem) -> Opt
         source_hash, source_bytes = hash_file(source)
         old_hash, old_bytes = hash_file(old)
         source_after, old_after = source.stat(), old.stat()
-        fingerprint = lambda value: (value.st_size, value.st_mtime_ns, value.st_dev, value.st_ino)
-        if fingerprint(source_before) != fingerprint(source_after) or fingerprint(old_before) != fingerprint(old_after):
+        if _fingerprint(source_before) != _fingerprint(source_after) or _fingerprint(old_before) != _fingerprint(old_after):
             return None
         if source_bytes != item.size or old_bytes != item.leaving_size or source_hash != old_hash:
             return None
-        return ProvenRename(item.related_path, item.path, item.size, source_hash)
+        return ProvenRename(
+            item.related_path, item.path, item.size, source_hash, str(source),
+            _fingerprint(source_after), _fingerprint(old_after),
+        )
     except OSError:
         return None
 
 
-def execute_local_rename(current_root: Path, proven: ProvenRename) -> None:
-    """Atomically move the proven current file, refusing overwrite or aliasing."""
-    old = _path(current_root, proven.old_path)
-    new = _path(current_root, proven.new_path)
-    if new.exists() or not old.is_file():
-        raise OSError("rename target exists or source disappeared")
-    new.parent.mkdir(parents=True, exist_ok=True)
-    os.rename(old, new)
+RENAME_EXCL = 0x00000004
 
+
+def rename_no_replace(source_dir_fd: int, source_name: str,
+                      destination_dir_fd: int, destination_name: str) -> None:
+    """Use macOS' atomic no-replace rename; never emulate it unsafely."""
+    try:
+        function = ctypes.CDLL(None, use_errno=True).renameatx_np
+    except AttributeError as exc:
+        raise RenameOptimizationUnavailable("atomic rename-no-replace is unsupported") from exc
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    result = function(
+        source_dir_fd, os.fsencode(source_name), destination_dir_fd,
+        os.fsencode(destination_name), RENAME_EXCL,
+    )
+    if result == 0:
+        return
+    code = ctypes.get_errno()
+    labels = {
+        errno.EEXIST: "destination already exists or appeared concurrently",
+        errno.ENOENT: "source disappeared",
+        errno.EXDEV: "cross-device rename is unsupported",
+        errno.ENOTSUP: "filesystem does not support exclusive rename",
+        errno.EPERM: "rename permission denied",
+        errno.EACCES: "rename permission denied",
+    }
+    if code in labels:
+        raise RenameOptimizationUnavailable(labels[code])
+    raise RenameStateAmbiguous(f"rename-no-replace failed with errno {code}: {os.strerror(code)}")
+
+
+def _open_directory_chain(root: Path, parts: Tuple[str, ...], *, create: bool) -> int:
+    """Open a directory chain by fd, rejecting symlinks at every component."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    if root.is_symlink():
+        raise RenameOptimizationUnavailable("current root must not be a symlink")
+    root_resolved = root.resolve(strict=True)
+    descriptor = os.open(root_resolved, flags)
+    try:
+        for part in parts:
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _leaf_state(directory_fd: int, leaf: str) -> Optional[os.stat_result]:
+    try:
+        return os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def execute_local_rename(
+    current_root: Path, proven: ProvenRename, *,
+    primitive: Callable[[int, str, int, str], None] = rename_no_replace,
+) -> None:
+    """Move exactly the proved inode within current, atomically without replace."""
+    old_relative = PurePosixPath(proven.old_path)
+    new_relative = PurePosixPath(proven.new_path)
+    if old_relative == new_relative:
+        raise RenameOptimizationUnavailable("source and destination paths are identical")
+    old_fd = new_fd = None
+    try:
+        old_fd = _open_directory_chain(current_root, tuple(old_relative.parts[:-1]), create=False)
+        new_fd = _open_directory_chain(current_root, tuple(new_relative.parts[:-1]), create=True)
+        old_state = _leaf_state(old_fd, old_relative.name)
+        if old_state is None:
+            raise RenameOptimizationUnavailable("source disappeared")
+        if not stat.S_ISREG(old_state.st_mode) or _fingerprint(old_state) != proven.old_fingerprint:
+            raise RenameOptimizationUnavailable("source is not the proved regular file")
+        source_state = os.stat(proven.source_path, follow_symlinks=False)
+        if not stat.S_ISREG(source_state.st_mode) or _fingerprint(source_state) != proven.source_fingerprint:
+            raise RenameOptimizationUnavailable("source catalogue file changed after identity proof")
+        if _leaf_state(new_fd, new_relative.name) is not None:
+            raise RenameOptimizationUnavailable("destination already exists")
+        try:
+            primitive(old_fd, old_relative.name, new_fd, new_relative.name)
+        except Exception as exc:
+            old_after = _leaf_state(old_fd, old_relative.name)
+            new_after = _leaf_state(new_fd, new_relative.name)
+            if old_after is not None and _fingerprint(old_after) == proven.old_fingerprint:
+                if isinstance(exc, RenameOptimizationUnavailable):
+                    raise
+                raise RenameOptimizationUnavailable(
+                    f"rename primitive failed without moving source: {exc}"
+                ) from exc
+            if old_after is None and new_after is not None and _fingerprint(new_after) == proven.old_fingerprint:
+                return
+            raise RenameStateAmbiguous(
+                f"rename primitive failure left an ambiguous filesystem state: {exc}"
+            ) from exc
+        old_after = _leaf_state(old_fd, old_relative.name)
+        new_after = _leaf_state(new_fd, new_relative.name)
+        if old_after is not None or new_after is None or _fingerprint(new_after) != proven.old_fingerprint:
+            raise RenameStateAmbiguous(
+                "rename reported success but did not publish exactly the proved file"
+            )
+    except RenameOptimizationUnavailable:
+        raise
+    except RenameStateAmbiguous:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RenameOptimizationUnavailable(f"unsafe or unavailable rename path: {exc}") from exc
+    finally:
+        if old_fd is not None:
+            os.close(old_fd)
+        if new_fd is not None:
+            os.close(new_fd)

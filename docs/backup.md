@@ -175,6 +175,14 @@ stable SHA-256 reads of `source/new` and `current/old`. Only an exact match is
 moved atomically inside `current`; every unavailable or inconclusive case keeps
 the normal `archive old + transfer new` fallback.
 
+On macOS the move uses `renameatx_np(..., RENAME_EXCL)` through directory file
+descriptors opened with `O_NOFOLLOW`. Existing or concurrently-created targets
+therefore cannot be replaced, and symlinked path components cannot redirect the
+move outside `current/`. Platforms without a native atomic no-replace primitive
+disable this optimization and retain the normal fallback. Source and old-file
+fingerprints are revalidated immediately before the syscall; its post-state is
+also checked. An ambiguous result fails the run and retains the rename journal.
+
 Native `--track-renames` is intentionally not enabled: its global matching can
 act outside the immutable candidate mapping, and its destination-side move does
 not create a physical old-path copy in `--backup-dir`. An optimized action is
