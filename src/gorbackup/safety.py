@@ -44,6 +44,8 @@ class SafetyAssessment:
     change_count: int = 0
     change_bytes: int = 0
     change_catalogue_percent: float = 0.0
+    rename_count: int = 0
+    rename_bytes: int = 0
     source_file_count: int = 0
     source_total_bytes: int = 0
     reference_kind: str = "none"
@@ -81,9 +83,8 @@ def assess_plan_safety(
     disk_usage: Callable[[object], object] = shutil.disk_usage,
 ) -> SafetyAssessment:
     """Assess deletion, shrink, change-volume, and capacity gates."""
-    destructive = tuple(item for item in plan.items if item.category in {
-        "delete_from_current", "rename_move_candidate"
-    })
+    destructive = tuple(item for item in plan.items if item.category == "delete_from_current")
+    renames = tuple(item for item in plan.items if item.category == "rename_move_candidate")
     changed = tuple(item for item in plan.items if item.category in {
         "new_file", "changed_file", "rename_move_candidate"
     })
@@ -160,6 +161,7 @@ def assess_plan_safety(
         free_bytes_after=free_after, free_percent_after=free_percent_after,
         change_count=change_count, change_bytes=change_bytes,
         change_catalogue_percent=change_ratio,
+        rename_count=len(renames), rename_bytes=sum(item.size for item in renames),
         source_file_count=plan.catalogue_file_count,
         source_total_bytes=plan.catalogue_total_bytes,
         reference_kind=reference.kind, reference_run_id=reference.run_id,

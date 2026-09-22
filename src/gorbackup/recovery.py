@@ -111,6 +111,7 @@ def find_history(config: AppConfig, requested_path: str) -> HistoryResult:
     with Ledger(config.ledger_path, read_only=True) as ledger:
         current_evidence = ledger.current_version(relative)
         rows = ledger.historical_versions(relative)
+        logical_renames = ledger.logical_renames(relative) if ledger.schema_version >= 6 else []
 
     current_path = _contained_path(current_root, relative, must_exist=False)
     current = None
@@ -145,6 +146,14 @@ def find_history(config: AppConfig, requested_path: str) -> HistoryResult:
             str(row["status"]), int(row["size"]), row["checksum"],
             _reason(str(row["classification"]), row["plan_category"]),
             historical_path, exists,
+        ))
+    for row in logical_renames:
+        run_id = validate_run_id(str(row["run_id"]))
+        versions.append(HistoryVersion(
+            "logical_move", run_id, row["completed_at"] or row["started_at"],
+            str(row["status"]), int(row["size"]), row["checksum"],
+            f"moved to {row['path']} (no physical historical copy)",
+            _contained_path(current_root, str(row["path"]), must_exist=False), False,
         ))
     if current is None and not versions:
         raise RecoveryError(f"no current or historical version recorded for: {relative}")

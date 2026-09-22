@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from gorbackup.config import AppConfig
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class LedgerError(RuntimeError):
@@ -55,10 +55,14 @@ CREATE TABLE runs (
     planned_transfer_bytes INTEGER NOT NULL DEFAULT 0,
     planned_archive_files INTEGER NOT NULL DEFAULT 0,
     planned_archive_bytes INTEGER NOT NULL DEFAULT 0,
+    planned_rename_files INTEGER NOT NULL DEFAULT 0,
+    planned_rename_bytes INTEGER NOT NULL DEFAULT 0,
     executed_transfer_files INTEGER NOT NULL DEFAULT 0,
     executed_transfer_bytes INTEGER NOT NULL DEFAULT 0,
     executed_archive_files INTEGER NOT NULL DEFAULT 0,
     executed_archive_bytes INTEGER NOT NULL DEFAULT 0,
+    executed_rename_files INTEGER NOT NULL DEFAULT 0,
+    executed_rename_bytes INTEGER NOT NULL DEFAULT 0,
     warnings_json TEXT NOT NULL DEFAULT '[]',
     errors_json TEXT NOT NULL DEFAULT '[]'
 );
@@ -133,9 +137,10 @@ CREATE TABLE safety_assessments (
 CREATE TABLE execution_items (
     item_id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL REFERENCES executions(run_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL CHECK (operation IN ('transfer', 'archive')),
+    operation TEXT NOT NULL CHECK (operation IN ('transfer', 'archive', 'rename')),
     classification TEXT NOT NULL,
     path TEXT NOT NULL,
+    related_path TEXT,
     size INTEGER NOT NULL,
     checksum TEXT,
     message TEXT NOT NULL
@@ -198,7 +203,7 @@ CREATE INDEX idx_execution_items_run_operation ON execution_items(run_id, operat
 CREATE INDEX idx_reconciliation_items_run ON reconciliation_items(run_id);
 CREATE INDEX idx_verification_items_run_status ON verification_items(run_id, status);
 CREATE INDEX idx_restore_runs_started ON restore_runs(started_at DESC);
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 """
 
 _V1_TABLES = (
@@ -259,14 +264,23 @@ class Ledger:
         has_runs = self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
         ).fetchone()
-        if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION):
+        if version not in (0, 1, 2, 3, 4, 5, SCHEMA_VERSION):
             raise LedgerError(f"unsupported ledger schema version: {version}")
         if read_only:
             if not has_runs:
                 raise LedgerError(f"ledger does not exist or is not initialized: {path}")
             return
+        if version == 5:
+            self._migrate_v5()
+            self.schema_version = SCHEMA_VERSION
+            return
         if version == 4:
             self._migrate_v4()
+            columns = {row[1] for row in self.connection.execute("PRAGMA table_info(runs)")}
+            if "planned_rename_files" not in columns:
+                self._migrate_v5()
+            else:
+                self.connection.execute("PRAGMA user_version = 6")
             self.schema_version = SCHEMA_VERSION
             return
         if version in (1, 2, 3) or (version == 0 and has_runs):
@@ -299,6 +313,38 @@ class Ledger:
                 ALTER TABLE execution_items ADD COLUMN checksum TEXT;
                 CREATE INDEX idx_restore_runs_started ON restore_runs(started_at DESC);
                 PRAGMA user_version = 5;
+                COMMIT;
+                """
+            )
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def _migrate_v5(self) -> None:
+        """Add explicit rename evidence and metrics while preserving v5 rows."""
+        try:
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                ALTER TABLE runs ADD COLUMN planned_rename_files INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE runs ADD COLUMN planned_rename_bytes INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE runs ADD COLUMN executed_rename_files INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE runs ADD COLUMN executed_rename_bytes INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE execution_items RENAME TO execution_items_v5;
+                CREATE TABLE execution_items (
+                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL REFERENCES executions(run_id) ON DELETE CASCADE,
+                    operation TEXT NOT NULL CHECK (operation IN ('transfer', 'archive', 'rename')),
+                    classification TEXT NOT NULL, path TEXT NOT NULL, related_path TEXT,
+                    size INTEGER NOT NULL, checksum TEXT, message TEXT NOT NULL
+                );
+                INSERT INTO execution_items
+                    (item_id, run_id, operation, classification, path, size, checksum, message)
+                    SELECT item_id, run_id, operation, classification, path, size, checksum, message
+                    FROM execution_items_v5;
+                DROP TABLE execution_items_v5;
+                CREATE INDEX idx_execution_items_run_operation ON execution_items(run_id, operation);
+                PRAGMA user_version = 6;
                 COMMIT;
                 """
             )
@@ -340,8 +386,8 @@ class Ledger:
             raise LedgerError(f"invalid plan status: {status}")
         catalogue_file_count = len(catalogue_files)
         catalogue_total_bytes = sum(item.size for item in catalogue_files)
-        transfer_categories = {"new_file", "changed_file", "rename_move_candidate"}
-        archive_categories = {"delete_from_current", "changed_file", "rename_move_candidate"}
+        transfer_categories = {"new_file", "changed_file"}
+        archive_categories = {"delete_from_current", "changed_file"}
         planned_transfer_files = sum(counts.get(name, 0) for name in transfer_categories)
         planned_transfer_bytes = sum(byte_totals.get(name, 0) for name in transfer_categories)
         planned_archive_items = [item for item in items if item["category"] in archive_categories]
@@ -361,11 +407,14 @@ class Ledger:
             cursor = self.connection.execute(
                 """UPDATE runs SET completed_at=?, status=?, catalogue_file_count=?,
                    catalogue_total_bytes=?, planned_transfer_files=?, planned_transfer_bytes=?,
-                   planned_archive_files=?, planned_archive_bytes=?, warnings_json=?, errors_json=?
+                   planned_archive_files=?, planned_archive_bytes=?,
+                   planned_rename_files=?, planned_rename_bytes=?, warnings_json=?, errors_json=?
                    WHERE run_id=? AND status='running'""",
                 (completed_at, status, catalogue_file_count, catalogue_total_bytes,
                  planned_transfer_files, planned_transfer_bytes, len(planned_archive_items),
                  sum(int(item["leaving_size"]) for item in planned_archive_items),
+                 counts.get("rename_move_candidate", 0),
+                 byte_totals.get("rename_move_candidate", 0),
                  json.dumps(list(warnings)), json.dumps(list(errors)), run_id),
             )
             if cursor.rowcount != 1:
@@ -401,7 +450,7 @@ class Ledger:
                 checksum = prior[1]
             evidence.append((
                 run_id, item["operation"], item["classification"], item["path"],
-                item["size"], checksum, item["message"],
+                item.get("related_path"), item["size"], checksum, item["message"],
             ))
         with self.connection:
             self.connection.execute(
@@ -409,7 +458,7 @@ class Ledger:
                 (run_id, plan_run_id, history_path, report_path, reconciliation),
             )
             self.connection.executemany(
-                "INSERT INTO execution_items (run_id, operation, classification, path, size, checksum, message) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO execution_items (run_id, operation, classification, path, related_path, size, checksum, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 evidence,
             )
             self.connection.executemany(
@@ -428,7 +477,7 @@ class Ledger:
         if execution is None:
             raise LedgerError(f"execution evidence does not exist: {run_id}")
         plan = self.connection.execute(
-            "SELECT catalogue_file_count, catalogue_total_bytes, planned_transfer_files, planned_transfer_bytes, planned_archive_files, planned_archive_bytes FROM runs WHERE run_id=? AND operation='plan'",
+            "SELECT catalogue_file_count, catalogue_total_bytes, planned_transfer_files, planned_transfer_bytes, planned_archive_files, planned_archive_bytes, planned_rename_files, planned_rename_bytes FROM runs WHERE run_id=? AND operation='plan'",
             (execution["plan_run_id"],),
         ).fetchone()
         if plan is None:
@@ -439,6 +488,10 @@ class Ledger:
         ).fetchone()
         archives = self.connection.execute(
             "SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM execution_items WHERE run_id=? AND operation='archive'",
+            (run_id,),
+        ).fetchone()
+        renames = self.connection.execute(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM execution_items WHERE run_id=? AND operation='rename'",
             (run_id,),
         ).fetchone()
         with self.connection:
@@ -455,10 +508,12 @@ class Ledger:
             cursor = self.connection.execute(
                 """UPDATE runs SET completed_at=?, status=?, catalogue_file_count=?, catalogue_total_bytes=?,
                    planned_transfer_files=?, planned_transfer_bytes=?, planned_archive_files=?, planned_archive_bytes=?,
+                   planned_rename_files=?, planned_rename_bytes=?,
                    executed_transfer_files=?, executed_transfer_bytes=?, executed_archive_files=?, executed_archive_bytes=?,
+                   executed_rename_files=?, executed_rename_bytes=?,
                    warnings_json=?, errors_json=? WHERE run_id=? AND status='running'""",
                 (completed_at, status, *tuple(plan), transfers["count"], transfers["bytes"],
-                 archives["count"], archives["bytes"], json.dumps(list(warnings)),
+                 archives["count"], archives["bytes"], renames["count"], renames["bytes"], json.dumps(list(warnings)),
                  json.dumps(list(errors)), run_id),
             )
             if cursor.rowcount != 1:
@@ -485,7 +540,8 @@ class Ledger:
         plan = self.connection.execute(
             """SELECT catalogue_file_count, catalogue_total_bytes,
                       planned_transfer_files, planned_transfer_bytes,
-                      planned_archive_files, planned_archive_bytes
+                      planned_archive_files, planned_archive_bytes,
+                      planned_rename_files, planned_rename_bytes
                FROM runs WHERE run_id=? AND operation='plan'""", (plan_run_id,),
         ).fetchone()
         if plan is None:
@@ -495,7 +551,8 @@ class Ledger:
                 """UPDATE runs SET completed_at=?, status='blocked',
                    catalogue_file_count=?, catalogue_total_bytes=?,
                    planned_transfer_files=?, planned_transfer_bytes=?,
-                   planned_archive_files=?, planned_archive_bytes=?, errors_json=?
+                   planned_archive_files=?, planned_archive_bytes=?,
+                   planned_rename_files=?, planned_rename_bytes=?, errors_json=?
                    WHERE run_id=? AND status='running'""",
                 (completed_at, *tuple(plan), json.dumps([error]), run_id),
             )
@@ -585,7 +642,7 @@ class Ledger:
 
     def execution_items(self, run_id: str) -> List[Dict[str, object]]:
         return [dict(row) for row in self.connection.execute(
-            "SELECT operation, classification, path, size, checksum, message FROM execution_items WHERE run_id=? ORDER BY item_id", (run_id,)
+            "SELECT operation, classification, path, related_path, size, checksum, message FROM execution_items WHERE run_id=? ORDER BY item_id", (run_id,)
         ).fetchall()]
 
     def reconciliation_items(self, run_id: str) -> List[Dict[str, object]]:
@@ -619,6 +676,17 @@ class Ledger:
             (relative_path,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def logical_renames(self, old_path: str) -> List[Dict[str, object]]:
+        """Return non-restorable evidence that an old path moved elsewhere."""
+        return [dict(row) for row in self.connection.execute(
+            """SELECT r.run_id, r.started_at, r.completed_at, r.status,
+                      ei.path, ei.related_path, ei.size, ei.checksum
+               FROM execution_items ei JOIN runs r ON r.run_id=ei.run_id
+               WHERE ei.operation='rename' AND ei.related_path=?
+               ORDER BY COALESCE(r.completed_at, r.started_at) DESC, ei.item_id DESC""",
+            (old_path,),
+        ).fetchall()]
 
     def current_version(self, relative_path: str) -> Optional[Dict[str, object]]:
         row = self.connection.execute(

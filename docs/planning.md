@@ -31,3 +31,12 @@ as recent.
 ```sh
 gorbackup --config config/config.yaml plan
 ```
+
+## Rename candidates
+
+`rename_move_candidate` means only that one source-only and one current-only file
+share size and nanosecond mtime. Those fields reduce the search space; they never
+prove identity. Candidates use separate `planned_rename_files` and
+`planned_rename_bytes` metrics and are not counted as planned transfer bytes.
+Ambiguous groups remain ordinary additions/deletions. Recent paths are excluded
+before candidate detection and can never be optimized.

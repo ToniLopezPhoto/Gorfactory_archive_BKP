@@ -190,6 +190,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"executed_transfer_bytes={backup_result.executed_transfer_bytes}; "
             f"executed_archive_files={backup_result.executed_archive_files}; "
             f"executed_archive_bytes={backup_result.executed_archive_bytes}; "
+            f"executed_rename_files={backup_result.executed_rename_files}; "
+            f"executed_rename_bytes={backup_result.executed_rename_bytes}; "
             f"verified_files={backup_result.verification.verified_files}; "
             f"verified_bytes={backup_result.verification.verified_bytes}; "
             f"verification_failures={backup_result.verification.failures}; "
@@ -212,18 +214,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "plan":
-        transfer_files = sum(
-            plan_result.counts[name]
-            for name in ("new_file", "changed_file", "rename_move_candidate")
-        )
-        leaving_files = sum(
-            plan_result.counts[name]
-            for name in (
-                "delete_from_current",
-                "changed_file",
-                "rename_move_candidate",
-            )
-        )
         print(
             f"plan: {plan_result.status}; run_id={plan_result.run_id}; "
             f"catalogue_files={plan_result.catalogue_file_count}; "
@@ -232,7 +222,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"planned_transfer_bytes={plan_result.planned_transfer_bytes}; "
             f"planned_archive_files={plan_result.planned_archive_files}; "
             f"planned_archive_bytes={plan_result.planned_archive_bytes}; "
-            f"rename_candidates={plan_result.counts['rename_move_candidate']}; "
+            f"planned_rename_files={plan_result.planned_rename_files}; "
+            f"planned_rename_bytes={plan_result.planned_rename_bytes}; "
             f"skipped_recent={plan_result.counts['skipped_recent']}; "
             f"errors={plan_result.counts['error']}; manifest={plan_result.manifest_path}"
         )

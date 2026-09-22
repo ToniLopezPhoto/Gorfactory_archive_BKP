@@ -155,11 +155,11 @@ def verify_transfers(source_root: Path, destination_root: Path,
                      transfers: Iterable[object], *,
                      expected_sources: Optional[dict] = None,
                      hasher: Callable[[Path], Tuple[str, int]] = hash_file) -> VerificationResult:
-    """Verify only path-level execution records whose operation is ``transfer``."""
+    """Verify every operation that produces content in the current snapshot."""
     items = []
     for transfer in transfers:
         operation = transfer["operation"] if isinstance(transfer, dict) else transfer.operation
-        if operation != "transfer":
+        if operation not in {"transfer", "rename"}:
             continue
         path = transfer["path"] if isinstance(transfer, dict) else transfer.path
         expected = expected_sources.get(path) if expected_sources else None

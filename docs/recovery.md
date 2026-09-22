@@ -83,3 +83,8 @@ separate staging area. Runs that are `running`, `blocked`, or `failed` are not
 eligible, which prevents recovery from a history directory still being
 written. `history` may display their recorded evidence and status for
 diagnosis, but remains read-only.
+
+Optimized renames do not invent a restorable historical version: no duplicate
+old-path file exists under `history/<run_id>`. The history browser reports a
+`logical_move` saying `moved to <new path> (no physical historical copy)`.
+Fallback archive+transfer runs retain the ordinary physical historical version.

@@ -53,6 +53,8 @@ class PlanResult:
     planned_archive_files: int
     planned_archive_bytes: int
     manifest_path: Path
+    planned_rename_files: int = 0
+    planned_rename_bytes: int = 0
 
     @property
     def transfer_bytes(self) -> int:
@@ -459,13 +461,10 @@ def create_plan(
                 if temporary.exists():
                     temporary.unlink()
 
-    planned_transfer_bytes = sum(
-        byte_totals[name]
-        for name in ("new_file", "changed_file", "rename_move_candidate")
-    )
-    planned_transfer_files = sum(
-        counts[name] for name in ("new_file", "changed_file", "rename_move_candidate")
-    )
+    planned_transfer_bytes = sum(byte_totals[name] for name in ("new_file", "changed_file"))
+    planned_transfer_files = sum(counts[name] for name in ("new_file", "changed_file"))
+    planned_rename_files = counts["rename_move_candidate"]
+    planned_rename_bytes = byte_totals["rename_move_candidate"]
     planned_archive_items = tuple(
         item for item in items
         if item.category in {"delete_from_current", "changed_file", "rename_move_candidate"}
@@ -489,6 +488,8 @@ def create_plan(
         "planned_transfer_bytes": planned_transfer_bytes,
         "planned_archive_files": planned_archive_files,
         "planned_archive_bytes": planned_archive_bytes,
+        "planned_rename_files": planned_rename_files,
+        "planned_rename_bytes": planned_rename_bytes,
         "warnings": warnings,
         "items": serialized,
     }
@@ -510,4 +511,6 @@ def create_plan(
         planned_archive_files,
         planned_archive_bytes,
         manifest_path,
+        planned_rename_files,
+        planned_rename_bytes,
     )

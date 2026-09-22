@@ -72,7 +72,7 @@ def test_assessment_reports_delete_and_projected_capacity(tmp_path: Path) -> Non
     assert result.free_percent_after == 40.0
 
 
-def test_rename_candidate_counts_as_destination_delete(tmp_path: Path) -> None:
+def test_rename_candidate_is_tracked_separately_from_destination_delete(tmp_path: Path) -> None:
     config = make_config(tmp_path, SafetyConfig(0, 2, 0, 0, 0, 0.8))
     plan = make_plan(
         PlanItem(
@@ -85,12 +85,12 @@ def test_rename_candidate_counts_as_destination_delete(tmp_path: Path) -> None:
         )
     )
 
-    with pytest.raises(SafetyError, match="max_deletes_per_run"):
-        assess_plan_safety(
-            config,
-            plan,
-            disk_usage=lambda path: Usage(100, 0, 100),
-        )
+    assessment = assess_plan_safety(
+        config, plan, disk_usage=lambda path: Usage(100, 0, 100)
+    )
+    assert assessment.delete_count == 0
+    assert assessment.rename_count == 1
+    assert assessment.rename_bytes == 10
 
 
 def test_all_safety_failures_are_reported_together(tmp_path: Path) -> None:

@@ -165,3 +165,24 @@ ledger, or known-good state.
 ```sh
 gorbackup --config config/config.yaml backup
 ```
+
+## Rename optimization
+
+Gorbackup probes both endpoints with `rclone backend features`. Optimization is
+enabled only when both are local, they advertise a common content hash, and the
+destination advertises `Move`. Each candidate is then proved independently by
+stable SHA-256 reads of `source/new` and `current/old`. Only an exact match is
+moved atomically inside `current`; every unavailable or inconclusive case keeps
+the normal `archive old + transfer new` fallback.
+
+Native `--track-renames` is intentionally not enabled: its global matching can
+act outside the immutable candidate mapping, and its destination-side move does
+not create a physical old-path copy in `--backup-dir`. An optimized action is
+recorded as `rename`, with `path=new`, `related_path=old`, and classification
+`optimized_move`. Transfers and renames each require exactly one SHA-256
+verification result before success and known-good promotion.
+
+An fsynced rename journal is written before destination moves. A crash before
+durable ledger evidence leaves the journal in state and blocks the next backup
+for operator reconciliation. Hash proof plus post-move verification adds local
+I/O, but avoids retransferring large unchanged files from the SAM.
