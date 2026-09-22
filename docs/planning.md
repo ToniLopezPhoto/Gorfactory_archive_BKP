@@ -18,6 +18,16 @@ only a conservative candidate based on unique size and modification-time equalit
 Plans containing comparison, parse, or filesystem errors are persisted as failed
 and cannot execute.
 
+The planner compares its before/after inventories path by path. A stable file
+that changes, disappears, or appears without a demonstrably recent timestamp
+still fails the immutable plan. A path already inside the fixed grace cutoff may
+change or disappear, and a demonstrably recent path may appear; these cases are
+represented once as `skipped_recent` using the latest available metadata. The
+path remains explicitly excluded from live execution even when it disappeared
+during planning. This exception is deliberately narrow: a previously stable file
+that begins changing during the dry-run fails closed rather than being reclassified
+as recent.
+
 ```sh
 gorbackup --config config/config.yaml plan
 ```

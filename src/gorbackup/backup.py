@@ -13,6 +13,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from gorbackup.config import AppConfig
 from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import Ledger, validate_state_location
+from gorbackup.locking import BackupLock
 from gorbackup.planner import PlanResult, _atomic_json, create_plan
 from gorbackup.baseline import load_baseline_summary
 from gorbackup.safety import (
@@ -83,6 +84,14 @@ class BackupResult:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _rclone_literal_path(path: str) -> str:
+    """Return an anchored rclone filter pattern matching one literal path."""
+    escaped = path.replace("\\", "\\\\")
+    for character in "*?[]{}":
+        escaped = escaped.replace(character, "\\" + character)
+    return "/" + escaped
 
 
 def parse_execution_log(lines: Iterable[str]) -> Tuple[List[ExecutionItem], List[str], List[str]]:
@@ -246,10 +255,34 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
                planner: Callable[..., PlanResult] = create_plan,
                safety_checker: Callable[..., SafetyAssessment] = assess_plan_safety,
                override_safety: bool = False,
-               manual_context: bool = False) -> BackupResult:
+               manual_context: bool = False,
+               lock_factory: Callable[..., BackupLock] = BackupLock) -> BackupResult:
+    """Run planning through persistence while holding exclusive backup ownership."""
+    validate_state_location(config)
+    lock = lock_factory(
+        config.state_root / "backup.lock",
+        run_id=f"backup-attempt-{uuid.uuid4().hex}",
+        now=now,
+    )
+    with lock:
+        return _run_backup_locked(
+            config, rclone, runner=runner, now=now,
+            run_id_factory=run_id_factory, planner=planner,
+            safety_checker=safety_checker, override_safety=override_safety,
+            manual_context=manual_context,
+        )
+
+
+def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
+                       runner: Callable[..., subprocess.CompletedProcess],
+                       now: Callable[[], datetime],
+                       run_id_factory: Callable[[], str],
+                       planner: Callable[..., PlanResult],
+                       safety_checker: Callable[..., SafetyAssessment],
+                       override_safety: bool,
+                       manual_context: bool) -> BackupResult:
     if override_safety and not manual_context:
         raise BackupError("--override-safety requires an interactive manual session")
-    validate_state_location(config)
     plan = planner(config, rclone, runner=runner, now=now)
     if plan.status != "success":
         raise BackupError(f"refusing to execute failed plan: {plan.run_id}")
@@ -323,6 +356,11 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
     ]
     if config.safety.ignore_recent_minutes:
         command.extend(["--min-age", f"{config.safety.ignore_recent_minutes}m"])
+    for item in plan.items:
+        if item.category == "skipped_recent":
+            # Pin the immutable plan's grace decision. A file close to the age
+            # boundary must not become transferable during this same run.
+            command.extend(["--exclude", _rclone_literal_path(item.path)])
 
     with Ledger(config.ledger_path) as ledger:
         try:

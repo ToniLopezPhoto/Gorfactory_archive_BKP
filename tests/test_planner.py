@@ -196,7 +196,10 @@ def test_plan_fails_if_catalogue_changes_during_dry_run(tmp_path: Path) -> None:
     (config.source.path / "stable.tif").write_bytes(b"stable")
 
     def runner(command, **kwargs):
-        (config.source.path / "arrived-during-plan.tif").write_bytes(b"late")
+        arrived = config.source.path / "arrived-during-plan.tif"
+        arrived.write_bytes(b"late")
+        old_ns = int((FIXED_TIME.timestamp() - 3600) * 1_000_000_000)
+        os.utime(arrived, ns=(old_ns, old_ns))
         Path(command[command.index("--combined") + 1]).write_text("", encoding="utf-8")
         Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -208,3 +211,200 @@ def test_plan_fails_if_catalogue_changes_during_dry_run(tmp_path: Path) -> None:
 
     assert result.status == "failed"
     assert any("changed while" in item.reason for item in result.items)
+
+
+def test_recent_file_is_explicit_not_actionable_and_old_sibling_is_eligible(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    folder = config.source.path / "shoot"
+    folder.mkdir()
+    recent = folder / "recent.tif"
+    old = folder / "old.tif"
+    recent.write_bytes(b"recent")
+    old.write_bytes(b"old")
+    recent_ns = int(FIXED_TIME.timestamp() * 1_000_000_000)
+    old_ns = recent_ns - 60 * 60 * 1_000_000_000
+    os.utime(recent, ns=(recent_ns, recent_ns))
+    os.utime(old, ns=(old_ns, old_ns))
+
+    def runner(command, **kwargs):
+        Path(command[command.index("--combined") + 1]).write_text(
+            "+ shoot/recent.tif\n+ shoot/old.tif\n", encoding="utf-8"
+        )
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "recent-plan",
+    )
+    assert [(item.category, item.path) for item in result.items] == [
+        ("new_file", "shoot/old.tif"),
+        ("skipped_recent", "shoot/recent.tif"),
+    ]
+    assert result.planned_transfer_files == 1
+
+
+def test_recent_file_becomes_eligible_after_grace_window(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    recent = config.source.path / "recent.tif"
+    recent.write_bytes(b"recent")
+    timestamp = int(FIXED_TIME.timestamp() * 1_000_000_000)
+    os.utime(recent, ns=(timestamp, timestamp))
+
+    def runner(command, **kwargs):
+        Path(command[command.index("--combined") + 1]).write_text(
+            "+ recent.tif\n", encoding="utf-8"
+        )
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    later = datetime.fromtimestamp(FIXED_TIME.timestamp() + 16 * 60, timezone.utc)
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: later, run_id_factory=lambda: "aged-plan",
+    )
+    assert [(item.category, item.path) for item in result.items] == [
+        ("new_file", "recent.tif")
+    ]
+
+
+def _set_mtime(path: Path, moment: datetime) -> None:
+    timestamp_ns = int(moment.timestamp() * 1_000_000_000)
+    os.utime(path, ns=(timestamp_ns, timestamp_ns))
+
+
+def test_recent_file_mutating_during_plan_is_one_final_skipped_item(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    path = config.source.path / "active edit.tif"
+    path.write_bytes(b"first")
+    _set_mtime(path, FIXED_TIME)
+
+    def runner(command, **kwargs):
+        path.write_bytes(b"second-version")
+        _set_mtime(path, datetime.fromtimestamp(FIXED_TIME.timestamp() + 2, timezone.utc))
+        Path(command[command.index("--combined") + 1]).write_text(
+            "+ active edit.tif\n", encoding="utf-8"
+        )
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "recent-mutated",
+    )
+    matching = [item for item in result.items if item.path == "active edit.tif"]
+    assert result.status == "success"
+    assert [(item.category, item.size) for item in matching] == [
+        ("skipped_recent", len(b"second-version"))
+    ]
+
+
+def test_recent_file_appearing_during_plan_is_skipped_not_actionable(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    path = config.source.path / "new-üñícode[1].tif"
+
+    def runner(command, **kwargs):
+        path.write_bytes(b"new")
+        _set_mtime(path, FIXED_TIME)
+        Path(command[command.index("--combined") + 1]).write_text(
+            "+ new-üñícode[1].tif\n", encoding="utf-8"
+        )
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "recent-appeared",
+    )
+    assert result.status == "success"
+    assert [(item.category, item.path) for item in result.items] == [
+        ("skipped_recent", path.name)
+    ]
+
+
+def test_recent_file_disappearing_during_plan_remains_pinned_skipped(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    source = config.source.path / "vanished.tif"
+    current = config.archive.root / config.archive.current_dir / "vanished.tif"
+    source.write_bytes(b"editing")
+    current.write_bytes(b"protected")
+    _set_mtime(source, FIXED_TIME)
+
+    def runner(command, **kwargs):
+        source.unlink()
+        Path(command[command.index("--combined") + 1]).write_text(
+            "- vanished.tif\n", encoding="utf-8"
+        )
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "recent-disappeared",
+    )
+    assert result.status == "success"
+    assert [(item.category, item.path) for item in result.items] == [
+        ("skipped_recent", "vanished.tif")
+    ]
+    assert result.planned_archive_files == 0
+
+
+def test_stable_mutation_and_unproven_appearance_still_fail_closed(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    stable = config.source.path / "stable.tif"
+    stable.write_bytes(b"old")
+    old_time = datetime.fromtimestamp(FIXED_TIME.timestamp() - 3600, timezone.utc)
+    _set_mtime(stable, old_time)
+
+    def runner(command, **kwargs):
+        stable.write_bytes(b"new-longer")
+        _set_mtime(stable, FIXED_TIME)
+        appeared = config.source.path / "old-appearance.tif"
+        appeared.write_bytes(b"old timestamp")
+        _set_mtime(appeared, old_time)
+        Path(command[command.index("--combined") + 1]).write_text("", encoding="utf-8")
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "stable-changes",
+    )
+    assert result.status == "failed"
+    error = next(item for item in result.items if item.category == "error")
+    assert "stable.tif" in error.reason
+    assert "old-appearance.tif" in error.reason
+
+
+def test_recent_mutation_does_not_hide_stable_sibling_action(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    folder = config.source.path / "same folder"
+    folder.mkdir()
+    stable = folder / "stable.tif"
+    recent = folder / "recent.tif"
+    stable.write_bytes(b"stable")
+    recent.write_bytes(b"recent")
+    old_time = datetime.fromtimestamp(FIXED_TIME.timestamp() - 3600, timezone.utc)
+    _set_mtime(stable, old_time)
+    _set_mtime(recent, FIXED_TIME)
+
+    def runner(command, **kwargs):
+        recent.write_bytes(b"recent changed")
+        _set_mtime(recent, FIXED_TIME)
+        Path(command[command.index("--combined") + 1]).write_text(
+            "+ same folder/stable.tif\n+ same folder/recent.tif\n", encoding="utf-8"
+        )
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "mixed-folder",
+    )
+    assert result.status == "success"
+    assert [(item.category, item.path) for item in result.items] == [
+        ("new_file", "same folder/stable.tif"),
+        ("skipped_recent", "same folder/recent.tif"),
+    ]

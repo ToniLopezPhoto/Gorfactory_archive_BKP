@@ -8,7 +8,13 @@ interchangeable:
 3. **execution** — successful path operations reported by the real rclone run;
 4. **reconciliation** — the comparison between planned and executed operations;
 5. **known-good state** — the catalogue snapshot promoted only after an exact,
-   successful reconciliation.
+successful reconciliation.
+
+When an exact backup skips recent files, promotion builds the protected snapshot:
+non-recent plan metadata replaces known-good normally, previous known-good
+metadata is retained for an already-protected skipped path, and a newly created
+skipped path is omitted. Consequently known-good never claims that an excluded
+new version was copied.
 
 ## Metrics have one meaning
 

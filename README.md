@@ -76,7 +76,9 @@ gorbackup --config config/config.yaml backup
 ```
 
 The real run records independent machine-readable execution evidence and
-reconciles it path by path against the immutable plan. See
+reconciles it path by path against the immutable plan. It also holds an atomic
+single-run lock throughout planning and execution, and reports recently modified
+regular files explicitly without treating them as backed up. See
 [docs/backup.md](docs/backup.md) for execution, divergence, and recovery semantics.
 
 ## Development

@@ -18,7 +18,9 @@ creating, or modifying the paths it contains.
 - `safety.max_deletes_per_run`: maximum number of deletions allowed in one run.
 - `safety.max_delete_size_gb`: maximum combined deletion size in GiB.
 - `safety.min_free_space_percent`: required free space from 0 through 100.
-- `safety.ignore_recent_minutes`: age below which source changes are ignored.
+- `safety.ignore_recent_minutes`: regular source files newer than this age are
+  explicitly planned as `skipped_recent`, excluded from transfer, and reconsidered
+  after they age out of the window. Directories are never excluded by their mtime.
 - `safety.min_source_size_gb`: absolute minimum source size in GiB. This catches
   an empty or implausibly small source before a baseline manifest is available.
 - `safety.min_source_size_ratio`: minimum fraction (greater than 0 through 1) of both the file
