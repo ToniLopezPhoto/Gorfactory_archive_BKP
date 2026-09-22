@@ -1,5 +1,7 @@
 import sqlite3
 import hashlib
+import errno
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +70,25 @@ def seed_version(config: AppConfig, run_id: str, relative: str, content: bytes, 
     return path
 
 
+def seed_known_good(config: AppConfig, relative: str, content: bytes, *,
+                    mtime_ns: int, checksum: str = "sha256:known") -> Path:
+    current = config.archive.root / "current" / relative
+    current.parent.mkdir(parents=True, exist_ok=True)
+    current.write_bytes(content)
+    os.utime(current, ns=(mtime_ns, mtime_ns))
+    with Ledger(config.ledger_path) as ledger:
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO runs (run_id, operation, started_at, completed_at, status, source_identity, destination_identity) VALUES ('promoted-run', 'backup', ?, ?, 'success', 'source-id', 'archive-id')",
+                (FIXED.isoformat(), FIXED.isoformat()),
+            )
+            ledger.connection.execute(
+                "INSERT INTO known_good_files VALUES (?, ?, ?, ?, 'promoted-run')",
+                (relative, len(content), mtime_ns, checksum),
+            )
+    return current
+
+
 def test_history_shows_current_and_orders_multiple_versions(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     relative = "Campaign/photo.tif"
@@ -80,8 +101,58 @@ def test_history_shows_current_and_orders_multiple_versions(tmp_path: Path) -> N
     result = find_history(config, relative)
 
     assert result.current is not None and result.current.size == 3
+    assert result.current.state == "untracked_current"
+    assert result.current.checksum is None
     assert [item.run_id for item in result.versions] == ["new-run", "old-run"]
     assert all(item.reason == "overwritten" for item in result.versions)
+
+
+def test_current_matching_known_good_uses_its_checksum(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    seed_known_good(config, "photo.tif", b"version-one", mtime_ns=1_700_000_000_000_000_000)
+
+    result = find_history(config, "photo.tif")
+
+    assert result.current is not None
+    assert result.current.checksum == "sha256:known"
+    assert result.current.state == "matches_known_good"
+
+
+def test_current_differing_from_known_good_does_not_reuse_checksum(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    current = seed_known_good(
+        config, "photo.tif", b"version-one", mtime_ns=1_700_000_000_000_000_000
+    )
+    current.write_bytes(b"version-two-is-different")
+
+    result = find_history(config, "photo.tif")
+
+    assert result.current is not None
+    assert result.current.size == len(b"version-two-is-different")
+    assert result.current.checksum is None
+    assert result.current.state == "differs_from_known_good"
+
+
+def test_failed_backup_residue_is_not_described_as_known_good(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    current = seed_known_good(
+        config, "photo.tif", b"version-one", mtime_ns=1_700_000_000_000_000_000,
+        checksum="sha256:version-one",
+    )
+    current.write_bytes(b"version-two")
+    with Ledger(config.ledger_path) as ledger:
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO runs (run_id, operation, started_at, completed_at, status, source_identity, destination_identity) VALUES ('failed-run', 'backup', ?, ?, 'failed', 'source-id', 'archive-id')",
+                (FIXED.isoformat(), FIXED.isoformat()),
+            )
+
+    result = find_history(config, "photo.tif")
+
+    assert result.current is not None
+    assert result.current.path.read_bytes() == b"version-two"
+    assert result.current.checksum is None
+    assert result.current.state == "differs_from_known_good"
 
 
 def test_deleted_unicode_file_is_discovered_and_restored(tmp_path: Path) -> None:
@@ -222,6 +293,91 @@ def test_copy_exception_leaves_diagnostic_temp_and_failed_ledger(tmp_path: Path)
     assert final.with_name(".photo.tif.gorbackup-restore-partial-id.tmp").exists()
     with Ledger(config.ledger_path) as ledger:
         assert ledger.restore_history()[0]["status"] == "failed"
+
+
+def test_hardlink_unsupported_uses_verified_exclusive_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = make_config(tmp_path)
+    historical = seed_version(config, "run-1", "photo.tif", b"original",
+                              timestamp="2026-09-20T12:00:00+00:00")
+
+    def unsupported(source: Path, destination: Path) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    monkeypatch.setattr("gorbackup.recovery.os.link", unsupported)
+    result = restore_version(
+        config, "photo.tif", "run-1", now=lambda: FIXED,
+        restore_id_factory=lambda: "fallback-id",
+    )
+
+    assert result.destination_path.read_bytes() == b"original"
+    assert result.checksum == hashlib.sha256(b"original").hexdigest()
+    assert historical.read_bytes() == b"original"
+    with Ledger(config.ledger_path) as ledger:
+        assert ledger.restore_history()[0]["status"] == "success"
+
+
+def test_destination_publication_race_never_overwrites_other_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = make_config(tmp_path)
+    seed_version(config, "run-race", "photo.tif", b"original",
+                 timestamp="2026-09-20T12:00:00+00:00")
+
+    def racing_link(source: Path, destination: Path) -> None:
+        destination.write_bytes(b"other process")
+        raise FileExistsError(errno.EEXIST, "exists", destination)
+
+    monkeypatch.setattr("gorbackup.recovery.os.link", racing_link)
+    with pytest.raises(RecoveryError, match="destination appeared"):
+        restore_version(
+            config, "photo.tif", "run-race", now=lambda: FIXED,
+            restore_id_factory=lambda: "race-id",
+        )
+
+    output = config.archive.root / "recovery" / "race-id" / "photo.tif"
+    assert output.read_bytes() == b"other process"
+    with Ledger(config.ledger_path) as ledger:
+        assert ledger.restore_history()[0]["status"] == "failed"
+
+
+def test_fallback_failure_removes_partial_final_and_marks_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = make_config(tmp_path)
+    seed_version(config, "run-fallback", "photo.tif", b"original",
+                 timestamp="2026-09-20T12:00:00+00:00")
+
+    monkeypatch.setattr(
+        "gorbackup.recovery.os.link",
+        lambda source, destination: (_ for _ in ()).throw(
+            OSError(errno.EOPNOTSUPP, "hard links unsupported")
+        ),
+    )
+    monkeypatch.setattr(
+        "gorbackup.recovery.os.fsync",
+        lambda descriptor: (_ for _ in ()).throw(OSError("fallback fsync failed")),
+    )
+
+    def copy_without_fsync(source: Path, destination: Path) -> int:
+        destination.write_bytes(source.read_bytes())
+        return destination.stat().st_size
+
+    with pytest.raises(RecoveryError, match="fallback fsync failed"):
+        restore_version(
+            config, "photo.tif", "run-fallback", copier=copy_without_fsync,
+            now=lambda: FIXED, restore_id_factory=lambda: "fallback-failed-id",
+        )
+
+    output = config.archive.root / "recovery" / "fallback-failed-id" / "photo.tif"
+    temporary = output.with_name(".photo.tif.gorbackup-restore-fallback-failed-id.tmp")
+    assert not output.exists()
+    assert temporary.read_bytes() == b"original"
+    with Ledger(config.ledger_path) as ledger:
+        row = ledger.restore_history()[0]
+        assert row["status"] == "failed"
+        assert "publication" in row["error"]
 
 
 def test_restore_does_not_change_known_good(tmp_path: Path) -> None:

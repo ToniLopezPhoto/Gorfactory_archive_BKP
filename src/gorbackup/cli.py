@@ -260,7 +260,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             item = history_result.current
             checksum = item.checksum or "checksum unavailable"
-            print(f"current | {item.size} bytes | {checksum}")
+            print(f"current | {item.size} bytes | {checksum} | {item.state}")
         print("\nHistory")
         if not history_result.versions:
             print("no archived versions recorded")

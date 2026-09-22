@@ -18,6 +18,13 @@ availability. `recorded but missing` means the ledger has evidence for a
 version whose historical file is no longer present; that version cannot be
 restored.
 
+The current row describes the file physically present in `current/`. A
+known-good checksum is shown only when its recorded size and nanosecond mtime
+match that physical file. The row is labelled `matches_known_good`,
+`differs_from_known_good`, or `untracked_current`; the latter two states do not
+reuse a known-good checksum. A difference is evidence of version drift, not by
+itself a claim that the current file is corrupt.
+
 History discovery is read-only. It uses the SQLite ledger as its primary index
 and checks the corresponding files on disk; it does not scan history as a
 substitute for missing ledger evidence.
@@ -41,6 +48,13 @@ SHA-256, and only then publishes the final recovery file atomically. A known
 SHA-256 belonging to that historical version is also checked. If no historical
 checksum was persisted, gorbackup calculates SHA-256 for both the historical
 source and restored copy. The restore is successful only when they match.
+
+Publication first attempts a same-filesystem hard link, which is atomic and
+cannot replace a destination that appeared concurrently. On filesystems that
+do not support hard links, gorbackup creates the final path exclusively,
+copies from the already verified temporary, calls `fsync`, and verifies the
+final size and SHA-256 again. A failed fallback removes only the partial inode
+created by that restore and retains the verified temporary for diagnosis.
 
 An existing final file is never overwritten. A failed copy or verification
 leaves no final file; its temporary file may remain next to the intended output

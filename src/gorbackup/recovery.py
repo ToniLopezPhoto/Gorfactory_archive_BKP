@@ -1,5 +1,6 @@
 """Ledger-backed history discovery and non-destructive restores."""
 
+import errno
 import os
 import re
 import uuid
@@ -32,6 +33,7 @@ class HistoryVersion:
     reason: str
     path: Path
     exists: bool
+    state: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -116,10 +118,20 @@ def find_history(config: AppConfig, requested_path: str) -> HistoryResult:
         if not current_path.is_file():
             raise RecoveryError(f"current path is not a regular file: {relative}")
         stat_result = current_path.stat()
+        matches_known_good = bool(
+            current_evidence
+            and stat_result.st_size == int(current_evidence["size"])
+            and stat_result.st_mtime_ns == int(current_evidence["mtime_ns"])
+        )
+        state = (
+            "matches_known_good" if matches_known_good
+            else "differs_from_known_good" if current_evidence
+            else "untracked_current"
+        )
         current = HistoryVersion(
             "current", None, None, None, stat_result.st_size,
-            current_evidence.get("checksum") if current_evidence else None,
-            "current", current_path, True,
+            current_evidence.get("checksum") if matches_known_good else None,
+            "current", current_path, True, state,
         )
 
     versions = []
@@ -190,6 +202,79 @@ def _copy_stream(source: Path, destination: Path, *,
     return total
 
 
+_UNSUPPORTED_LINK_ERRORS = {
+    errno.EPERM,
+    getattr(errno, "EOPNOTSUPP", errno.EPERM),
+    getattr(errno, "ENOTSUP", errno.EPERM),
+}
+
+
+def _unlink_if_same_file(path: Path, identity: Tuple[int, int]) -> None:
+    """Remove only the exact fallback inode created by this process."""
+    try:
+        stat_result = path.lstat()
+        if (stat_result.st_dev, stat_result.st_ino) == identity:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _publish_by_exclusive_copy(
+    temporary: Path, output: Path, expected_checksum: str, expected_size: int, *,
+    hasher: Callable[[Path], Tuple[str, int]] = hash_file,
+) -> None:
+    descriptor: Optional[int] = None
+    identity: Optional[Tuple[int, int]] = None
+    try:
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino)
+        with temporary.open("rb") as reader, os.fdopen(descriptor, "wb") as writer:
+            descriptor = None
+            while True:
+                chunk = reader.read(COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                writer.write(chunk)
+            writer.flush()
+            os.fsync(writer.fileno())
+        actual_checksum, actual_size = hasher(output)
+        if actual_size != expected_size or actual_checksum != expected_checksum:
+            raise RecoveryError("fallback publication verification failed")
+    except FileExistsError as exc:
+        raise RecoveryError(f"destination appeared during restore: {output}") from exc
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        if identity is not None:
+            _unlink_if_same_file(output, identity)
+        raise
+
+
+def publish_verified_restore(
+    temporary: Path, output: Path, expected_checksum: str, expected_size: int, *,
+    linker: Optional[Callable[[Path, Path], None]] = None,
+    fallback: Optional[Callable[[Path, Path, str, int], None]] = None,
+) -> None:
+    """Publish verified staging without replacing a concurrent destination."""
+    linker = linker or os.link
+    fallback = fallback or _publish_by_exclusive_copy
+    try:
+        linker(temporary, output)
+    except FileExistsError as exc:
+        raise RecoveryError(f"destination appeared during restore: {output}") from exc
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_LINK_ERRORS:
+            raise RecoveryError(f"publication hard-link failed: {exc}") from exc
+        try:
+            fallback(temporary, output, expected_checksum, expected_size)
+        except RecoveryError:
+            raise
+        except Exception as fallback_exc:
+            raise RecoveryError(f"fallback publication failed: {fallback_exc}") from fallback_exc
+    temporary.unlink()
+
+
 def restore_version(
     config: AppConfig, requested_path: str, source_run_id: str, *,
     destination: Optional[Path] = None,
@@ -197,6 +282,7 @@ def restore_version(
     restore_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     copier: Callable[[Path, Path], int] = _copy_stream,
     hasher: Callable[[Path], Tuple[str, int]] = hash_file,
+    publisher: Callable[[Path, Path, str, int], None] = publish_verified_restore,
 ) -> RestoreResult:
     """Copy one completed historical version into verified recovery staging."""
     validate_state_location(config)
@@ -251,11 +337,7 @@ def restore_version(
         if (source_bytes != restored_bytes or source_checksum != restored_checksum
                 or restored_bytes != source_stat.st_size):
             raise RecoveryError("post-restore size or SHA-256 verification failed")
-        try:
-            os.link(temporary, output)
-        except FileExistsError as exc:
-            raise RecoveryError(f"destination appeared during restore: {output}") from exc
-        temporary.unlink()
+        publisher(temporary, output, source_checksum, restored_bytes)
         checksum = source_checksum
         with Ledger(config.ledger_path) as ledger:
             ledger.finish_restore(

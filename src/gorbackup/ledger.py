@@ -622,7 +622,7 @@ class Ledger:
 
     def current_version(self, relative_path: str) -> Optional[Dict[str, object]]:
         row = self.connection.execute(
-            """SELECT relative_path, size, checksum, promoted_by_run_id
+            """SELECT relative_path, size, mtime_ns, checksum, promoted_by_run_id
                FROM known_good_files WHERE relative_path=?""",
             (relative_path,),
         ).fetchone()
