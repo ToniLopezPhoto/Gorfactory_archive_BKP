@@ -31,6 +31,10 @@ safety:
 retention:
   auto_prune: false
 
+rename_optimization:
+  enabled: true
+  require_hash: true
+
 logging:
   level: INFO
   directory: logs

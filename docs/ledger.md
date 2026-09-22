@@ -1,5 +1,9 @@
 # Ledger model
 
+The current schema version is **6**. It adds explicit `rename` execution
+evidence (`path` is new and `related_path` is old), plus planned/executed rename
+file and byte metrics. Migration from v5 preserves existing evidence.
+
 The SQLite ledger separates six stages that must never be treated as
 interchangeable:
 
@@ -7,7 +11,7 @@ interchangeable:
 2. **plan** — immutable operations reported by a dry-run;
 3. **execution** — successful path operations reported by the real rclone run;
 4. **reconciliation** — the comparison between planned and executed operations;
-5. **verification** — SHA-256 evidence for each actual transfer;
+5. **verification** — SHA-256 evidence for each actual transfer or rename;
 6. **known-good state** — the catalogue snapshot promoted only after exact,
 successful reconciliation and verification.
 

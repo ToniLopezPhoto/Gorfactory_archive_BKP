@@ -24,6 +24,9 @@ from gorbackup.safety import (
     assess_plan_safety,
 )
 from gorbackup.verification import ExpectedSource, VerificationResult, verify_transfers
+from gorbackup.renames import (
+    RenameCapabilities, execute_local_rename, probe_rename_capabilities, prove_identity,
+)
 
 
 class BackupError(RuntimeError):
@@ -37,6 +40,7 @@ class ExecutionItem:
     path: str
     size: int
     message: str
+    related_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,8 @@ class BackupResult:
     report_path: Path
     manifest_path: Path
     divergences: Tuple[Divergence, ...]
+    executed_rename_files: int = 0
+    executed_rename_bytes: int = 0
     verification: VerificationResult = field(
         default_factory=lambda: VerificationResult("sha256", ())
     )
@@ -146,7 +152,7 @@ def parse_execution_log(lines: Iterable[str]) -> Tuple[List[ExecutionItem], List
                 classification = "deleted"
         if operation is None:
             continue
-        if operation not in {"transfer", "archive"}:
+        if operation not in {"transfer", "archive", "rename"}:
             errors.append(f"unknown execution operation at line {number}: {operation!r}")
             continue
         if not isinstance(path, str) or not path or path.startswith("/") or ".." in Path(path).parts:
@@ -155,18 +161,22 @@ def parse_execution_log(lines: Iterable[str]) -> Tuple[List[ExecutionItem], List
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             errors.append(f"invalid execution size at line {number}")
             continue
-        items.append(ExecutionItem(operation, str(classification or "unknown"), path, size, message))
+        related_path = entry.get("related_path")
+        if operation == "rename" and (not isinstance(related_path, str) or not related_path):
+            errors.append(f"rename missing related_path at line {number}")
+            continue
+        items.append(ExecutionItem(operation, str(classification or "unknown"), path, size, message, related_path))
     return items, warnings, errors
 
 
 def _planned_operations(plan: PlanResult) -> Dict[Tuple[str, str], Tuple[int, str]]:
     operations: Dict[Tuple[str, str], Tuple[int, str]] = {}
     for item in plan.items:
-        if item.category in {"new_file", "changed_file", "rename_move_candidate"}:
+        if item.category in {"new_file", "changed_file"}:
             expected = "new" if item.category == "new_file" else "replaced"
             operations[("transfer", item.path)] = (item.size, expected)
-        if item.category in {"delete_from_current", "changed_file", "rename_move_candidate"}:
-            archive_path = item.related_path if item.category == "rename_move_candidate" else item.path
+        if item.category in {"delete_from_current", "changed_file"}:
+            archive_path = item.path
             if archive_path:
                 operations[("archive", archive_path)] = (item.leaving_size, "versioned")
     return operations
@@ -212,11 +222,32 @@ def reconcile_execution(plan: PlanResult, executed: Sequence[ExecutionItem]) -> 
     for key, item in actual.items():
         if key in planned:
             continue
-        severity = "failure" if item.operation == "archive" else "warning"
+        candidate = next((value for value in plan.items if value.category == "rename_move_candidate" and (
+            (item.operation == "rename" and value.path == item.path and value.related_path == item.related_path)
+            or (item.operation == "transfer" and value.path == item.path)
+            or (item.operation == "archive" and value.related_path == item.path)
+        )), None)
+        if candidate is not None:
+            continue
+        severity = "failure" if item.operation in {"archive", "rename"} else "warning"
         divergences.append(Divergence(
             severity, "unplanned_execution", item.operation, item.path, None, item.size,
             "execution performed an operation absent from the immutable plan",
         ))
+    for candidate in (item for item in plan.items if item.category == "rename_move_candidate"):
+        rename = actual.get(("rename", candidate.path))
+        transfer = actual.get(("transfer", candidate.path))
+        archive = actual.get(("archive", candidate.related_path or ""))
+        optimized = rename is not None and transfer is None and archive is None
+        fallback = rename is None and transfer is not None and archive is not None
+        valid_rename = optimized and rename.related_path == candidate.related_path and rename.size == candidate.size and rename.classification == "optimized_move"
+        valid_fallback = fallback and transfer.size == candidate.size and archive.size == candidate.leaving_size
+        if not (valid_rename or valid_fallback):
+            divergences.append(Divergence(
+                "failure", "invalid_rename_outcome", "rename", candidate.path,
+                candidate.size, rename.size if rename else None,
+                "rename candidate must produce exactly one proven rename or archive+transfer fallback",
+            ))
     return tuple(divergences)
 
 
@@ -262,7 +293,9 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
                override_safety: bool = False,
                manual_context: bool = False,
                lock_factory: Callable[..., BackupLock] = BackupLock,
-               verifier: Callable[..., VerificationResult] = verify_transfers) -> BackupResult:
+               verifier: Callable[..., VerificationResult] = verify_transfers,
+               capability_prober: Callable[..., RenameCapabilities] = probe_rename_capabilities,
+               rename_executor: Callable[..., None] = execute_local_rename) -> BackupResult:
     """Run planning through persistence while holding exclusive backup ownership."""
     validate_state_location(config)
     lock = lock_factory(
@@ -271,11 +304,17 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
         now=now,
     )
     with lock:
+        journals = list(config.state_root.glob(".rename-journal-*.json")) if config.state_root.exists() else []
+        if journals:
+            raise BackupError(
+                "unfinished rename journal requires operator reconciliation: " + str(journals[0])
+            )
         return _run_backup_locked(
             config, rclone, runner=runner, now=now,
             run_id_factory=run_id_factory, planner=planner,
             safety_checker=safety_checker, override_safety=override_safety,
             manual_context=manual_context, verifier=verifier,
+            capability_prober=capability_prober, rename_executor=rename_executor,
         )
 
 
@@ -287,7 +326,9 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
                        safety_checker: Callable[..., SafetyAssessment],
                        override_safety: bool,
                        manual_context: bool,
-                       verifier: Callable[..., VerificationResult]) -> BackupResult:
+                       verifier: Callable[..., VerificationResult],
+                       capability_prober: Callable[..., RenameCapabilities],
+                       rename_executor: Callable[..., None]) -> BackupResult:
     if override_safety and not manual_context:
         raise BackupError("--override-safety requires an interactive manual session")
     plan = planner(config, rclone, runner=runner, now=now)
@@ -355,11 +396,13 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
     log_path = Path(log_name)
     report_path = config.manifests_root / f"execution-{run_id}.json"
     verification_report_path = config.manifests_root / f"verification-{run_id}.json"
+    fallback_delete_limit = config.safety.max_deletes_per_run + plan.planned_rename_files
+    fallback_delete_bytes = int(config.safety.max_delete_size_gb * 1024 ** 3) + plan.planned_rename_bytes
     command = [
         rclone.executable, "sync", str(config.source.path), str(current),
         "--use-json-log", "--log-level", "INFO", "--log-file", str(log_path),
-        "--backup-dir", str(history_path), "--max-delete", str(config.safety.max_deletes_per_run),
-        "--max-delete-size", f"{int(config.safety.max_delete_size_gb * 1024 ** 3)}B",
+        "--backup-dir", str(history_path), "--max-delete", str(fallback_delete_limit),
+        "--max-delete-size", f"{fallback_delete_bytes}B",
         "--exclude", f"/{config.source.marker_file}", "--retries", "1",
     ]
     if config.safety.ignore_recent_minutes:
@@ -370,10 +413,44 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
             # boundary must not become transferable during this same run.
             command.extend(["--exclude", _rclone_literal_path(item.path)])
 
+    optimized: List[ExecutionItem] = []
+    rename_journal = config.state_root / f".rename-journal-{run_id}.json"
+    if config.rename_optimization.enabled and any(
+        item.category == "rename_move_candidate" for item in plan.items
+    ):
+        capabilities = capability_prober(rclone, config.source.path, current)
+        if capabilities.can_optimize:
+            proven_items = []
+            for item in plan.items:
+                if item.category != "rename_move_candidate":
+                    continue
+                proven = prove_identity(config.source.path, current, item)
+                if proven is None:
+                    continue
+                proven_items.append(proven)
+            if proven_items:
+                _atomic_json(rename_journal, {
+                    "run_id": run_id, "plan_run_id": plan.run_id,
+                    "state": "prepared",
+                    "renames": [asdict(value) for value in proven_items],
+                })
+            for proven in proven_items:
+                try:
+                    rename_executor(current, proven)
+                except OSError:
+                    # A race or unsupported move falls back to normal rclone.
+                    continue
+                optimized.append(ExecutionItem(
+                    "rename", "optimized_move", proven.new_path, proven.size,
+                    "destination-side local rename after stable SHA-256 identity proof",
+                    proven.old_path,
+                ))
+
     with Ledger(config.ledger_path) as ledger:
         try:
             completed = runner(command, check=False, capture_output=True, text=True)
-            executed, log_warnings, log_errors = parse_execution_log(log_path.read_text(encoding="utf-8").splitlines())
+            rclone_items, log_warnings, log_errors = parse_execution_log(log_path.read_text(encoding="utf-8").splitlines())
+            executed = optimized + rclone_items
             if completed.returncode != 0 and not log_errors:
                 log_errors.append((completed.stderr or completed.stdout).strip() or f"rclone exited with {completed.returncode}")
             divergences = reconcile_execution(plan, executed) + audit_history(history_path, executed)
@@ -383,6 +460,8 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
                 run_id, plan.run_id, str(history_path), str(report_path),
                 [asdict(item) for item in executed], [asdict(item) for item in divergences],
             )
+            if rename_journal.exists():
+                rename_journal.unlink()
             # Read back the durable execution evidence: planned-only paths are
             # deliberately incapable of entering the verification scope.
             actual_items = ledger.execution_items(run_id)
@@ -401,6 +480,15 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
                 f"verification_{item.status}: {item.path}: {item.detail}"
                 for item in verification.items if item.status != "verified"
             ]
+            produced_paths = [
+                item["path"] for item in actual_items
+                if item["operation"] in {"transfer", "rename"}
+            ]
+            verification_paths = [item.path for item in verification.items]
+            if sorted(produced_paths) != sorted(verification_paths) or len(set(verification_paths)) != len(verification_paths):
+                verification_errors.append(
+                    "verification_coverage: every transfer and rename must have exactly one result"
+                )
             errors.extend(verification_errors)
             status = "failed" if completed.returncode != 0 or errors else "warning" if warnings else "success"
             completed_at = now()
@@ -437,6 +525,7 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
 
     transfers = [item for item in executed if item.operation == "transfer"]
     archives = [item for item in executed if item.operation == "archive"]
+    renames = [item for item in executed if item.operation == "rename"]
     manifest_path = config.manifests_root / f"backup-{run_id}.json"
     payload = {
         "schema_version": 3, "run_id": run_id, "plan_run_id": plan.run_id, "status": status,
@@ -445,8 +534,10 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
         "catalogue_file_count": plan.catalogue_file_count, "catalogue_total_bytes": plan.catalogue_total_bytes,
         "planned_transfer_files": plan.planned_transfer_files, "planned_transfer_bytes": plan.planned_transfer_bytes,
         "planned_archive_files": plan.planned_archive_files, "planned_archive_bytes": plan.planned_archive_bytes,
+        "planned_rename_files": plan.planned_rename_files, "planned_rename_bytes": plan.planned_rename_bytes,
         "executed_transfer_files": len(transfers), "executed_transfer_bytes": sum(i.size for i in transfers),
         "executed_archive_files": len(archives), "executed_archive_bytes": sum(i.size for i in archives),
+        "executed_rename_files": len(renames), "executed_rename_bytes": sum(i.size for i in renames),
         "verification_method": verification.method,
         "verified_files": verification.verified_files,
         "verified_bytes": verification.verified_bytes,
@@ -468,7 +559,10 @@ def _run_backup_locked(config: AppConfig, rclone: RcloneInfo, *,
         raise BackupError(
             "backup execution or verification failed; see " + str(report_path)
         )
-    return BackupResult(run_id, plan.run_id, status, len(transfers), sum(i.size for i in transfers),
-                        len(archives), sum(i.size for i in archives), safety, history_path,
-                        report_path, manifest_path, divergences, verification,
-                        verification_report_path)
+    return BackupResult(
+        run_id, plan.run_id, status, len(transfers), sum(i.size for i in transfers),
+        len(archives), sum(i.size for i in archives), safety, history_path,
+        report_path, manifest_path, divergences,
+        executed_rename_files=len(renames), executed_rename_bytes=sum(i.size for i in renames),
+        verification=verification, verification_report_path=verification_report_path,
+    )

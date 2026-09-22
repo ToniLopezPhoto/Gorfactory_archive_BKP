@@ -135,7 +135,9 @@ def test_plan_is_dry_run_persisted_and_classifies_rename_and_recent(tmp_path: Pa
         "skipped_recent": 1,
         "error": 0,
     }
-    assert result.transfer_bytes == 3 + 7 + 6
+    assert result.transfer_bytes == 3 + 7
+    assert result.planned_rename_files == 1
+    assert result.planned_rename_bytes == 6
     assert result.leaving_current_bytes == 7 + 3 + 6
     changed = next(item for item in result.items if item.category == "changed_file")
     assert changed.size == 7

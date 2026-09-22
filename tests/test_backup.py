@@ -26,6 +26,7 @@ from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import FileMetadata, Ledger
 from gorbackup.locking import BackupLock, LockError
 from gorbackup.planner import PlanItem, PlanResult
+from gorbackup.renames import BackendCapabilities, RenameCapabilities
 from gorbackup.safety import GateFailure, SafetyAssessment, SafetyError
 from gorbackup.verification import VerificationItem, VerificationResult
 
@@ -158,6 +159,62 @@ def real_transfer_runner(config: AppConfig, *, corrupt: bool = False):
         )
         return subprocess.CompletedProcess(command, 0, "", "")
     return runner
+
+
+def test_proven_rename_has_zero_transfer_bytes_and_promotes_new_path(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    source = config.source.path / "folderB" / "photo.tif"
+    old = config.archive.root / "current" / "folderA" / "photo.tif"
+    source.parent.mkdir(); old.parent.mkdir()
+    source.write_bytes(b"large synthetic payload")
+    old.write_bytes(b"large synthetic payload")
+    stat = source.stat()
+    item = PlanItem(
+        "rename_move_candidate", "folderB/photo.tif", stat.st_size,
+        "unique size and modification-time match", "folderA/photo.tif", stat.st_size,
+    )
+    counts = {name: 0 for name in (
+        "new_file", "changed_file", "delete_from_current",
+        "rename_move_candidate", "skipped_recent", "error",
+    )}
+    counts["rename_move_candidate"] = 1
+    plan = PlanResult(
+        "rename-plan", "success", (item,), counts,
+        {**{name: 0 for name in counts}, "rename_move_candidate": stat.st_size},
+        1, stat.st_size, 0, 0, 0, 0,
+        config.manifests_root / "plan-rename-plan.json", 1, stat.st_size,
+    )
+    with Ledger(config.ledger_path) as ledger:
+        ledger.start_run("rename-plan", FIXED_TIME.isoformat(), "source-id", "archive-id", "plan")
+        ledger.save_plan(
+            "rename-plan", FIXED_TIME.isoformat(), "success",
+            [{"category": item.category, "path": item.path, "related_path": item.related_path,
+              "size": item.size, "leaving_size": item.leaving_size, "reason": item.reason}],
+            counts, plan.byte_totals, [], [],
+            [FileMetadata(item.path, item.size, stat.st_mtime_ns)],
+        )
+    local = BackendCapabilities("local", frozenset({"sha1"}), True, True)
+    capabilities = RenameCapabilities(local, local, frozenset({"sha1"}), True)
+
+    def runner(command, **kwargs):
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = run_backup(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "rename-run",
+        planner=lambda *args, **kwargs: plan,
+        safety_checker=lambda *args, **kwargs: APPROVED,
+        capability_prober=lambda *args, **kwargs: capabilities,
+    )
+    assert result.executed_transfer_bytes == 0
+    assert result.executed_rename_files == 1
+    assert result.executed_rename_bytes == stat.st_size
+    assert not old.exists()
+    assert (config.archive.root / "current" / item.path).exists()
+    with Ledger(config.ledger_path) as ledger:
+        assert ledger.current_version(item.related_path) is None
+        assert ledger.current_version(item.path)["checksum"].startswith("sha256:")
 
 
 def test_real_verification_promotes_checksums_and_persists_evidence(tmp_path: Path) -> None:
@@ -551,6 +608,16 @@ def test_execution_log_is_machine_readable_and_rejects_ambiguous_events() -> Non
     ]
     assert warnings == []
     assert errors == ["invalid JSON execution log line 3"]
+
+
+def test_unexpected_rename_is_a_failure() -> None:
+    plan = PlanResult("plan", "success", (), {}, {}, 0, 0, 0, 0, 0, 0, Path("plan.json"))
+    divergences = reconcile_execution(plan, [
+        ExecutionItem("rename", "optimized_move", "new.tif", 5, "rename", "old.tif")
+    ])
+    assert [(item.divergence_type, item.severity) for item in divergences] == [
+        ("unplanned_execution", "failure")
+    ]
 
 
 def test_reported_archive_must_exist_in_history(tmp_path: Path) -> None:

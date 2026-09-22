@@ -67,6 +67,12 @@ class StateConfig:
 
 
 @dataclass(frozen=True)
+class RenameOptimizationConfig:
+    enabled: bool = True
+    require_hash: bool = True
+
+
+@dataclass(frozen=True)
 class AppConfig:
     source: SourceConfig
     archive: ArchiveConfig
@@ -74,6 +80,7 @@ class AppConfig:
     retention: RetentionConfig
     logging: LoggingConfig
     state: StateConfig = StateConfig()
+    rename_optimization: RenameOptimizationConfig = RenameOptimizationConfig()
 
     @property
     def state_root(self) -> Path:
@@ -138,6 +145,15 @@ def load_config(path: Path) -> AppConfig:
     state = raw.get("state", {})
     if not isinstance(state, Mapping):
         raise ConfigError("'state' must be a mapping")
+    rename_optimization = raw.get("rename_optimization", {})
+    if not isinstance(rename_optimization, Mapping):
+        raise ConfigError("'rename_optimization' must be a mapping")
+    rename_enabled = rename_optimization.get("enabled", True)
+    rename_require_hash = rename_optimization.get("require_hash", True)
+    if not isinstance(rename_enabled, bool):
+        raise ConfigError("'rename_optimization.enabled' must be true or false")
+    if rename_require_hash is not True:
+        raise ConfigError("'rename_optimization.require_hash' must be true")
 
     source_path = _required(source, "source", "path")
     source_mount = _required(source, "source", "mount_path")
@@ -294,5 +310,8 @@ def load_config(path: Path) -> AppConfig:
             ledger_file,
             baseline_manifest,
             baseline_report,
+        ),
+        rename_optimization=RenameOptimizationConfig(
+            enabled=rename_enabled, require_hash=rename_require_hash
         ),
     )
