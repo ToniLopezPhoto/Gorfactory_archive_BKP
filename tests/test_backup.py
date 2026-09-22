@@ -24,6 +24,7 @@ from gorbackup.config import (
 )
 from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import FileMetadata, Ledger
+from gorbackup.locking import BackupLock, LockError
 from gorbackup.planner import PlanItem, PlanResult
 from gorbackup.safety import GateFailure, SafetyAssessment, SafetyError
 
@@ -162,6 +163,7 @@ def test_backup_executes_sync_with_unique_versioned_history(tmp_path: Path) -> N
         assert run["executed_transfer_bytes"] == 10
         assert run["executed_archive_bytes"] == 9
         assert ledger.known_good_state()["run_id"] == "backup-1"
+    assert not (config.state_root / "backup.lock").exists()
 
 
 def test_backup_failure_is_recorded_and_has_no_success_manifest(tmp_path: Path) -> None:
@@ -193,6 +195,7 @@ def test_backup_failure_is_recorded_and_has_no_success_manifest(tmp_path: Path) 
         )
         assert run["status"] == "failed"
         assert "destination full" in run["errors_json"]
+    assert not (config.state_root / "backup.lock").exists()
 
 
 def test_backup_refuses_to_reuse_history_directory(tmp_path: Path) -> None:
@@ -238,6 +241,102 @@ def test_safety_rejection_blocks_execution_and_history_reservation(tmp_path: Pat
         assert assessment is not None
         assert "planned deletions exceed limit" in assessment["message"]
         assert ledger.known_good_state() is None
+    assert not (config.state_root / "backup.lock").exists()
+
+
+def test_active_lock_stops_before_planner_and_creates_no_run(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    active = BackupLock(config.state_root / "backup.lock", run_id="other")
+    active.acquire()
+    called = False
+
+    def unexpected_planner(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("planner must not run")
+
+    try:
+        with pytest.raises(LockError, match="backup already running"):
+            run_backup(
+                config, RcloneInfo("rclone", (1, 70, 0)), planner=unexpected_planner
+            )
+        assert called is False
+        assert not config.ledger_path.exists()
+    finally:
+        active.release()
+
+
+def test_recent_metadata_does_not_replace_last_protected_version(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    seed_plan(config)
+    with Ledger(config.ledger_path) as ledger:
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO plan_items (run_id, category, path, size, leaving_size, reason) "
+                "VALUES ('plan-1', 'skipped_recent', 'stable.tif', 5, 0, 'recent')"
+            )
+            ledger.connection.execute(
+                "INSERT INTO known_good_files VALUES ('stable.tif', 4, 0, NULL, 'plan-1')"
+            )
+            ledger.connection.execute(
+                "INSERT INTO known_good_state VALUES (1, 'plan-1', 1, 4, ?)",
+                (FIXED_TIME.isoformat(),),
+            )
+
+    def runner(command, **kwargs):
+        excludes = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--exclude"
+        ]
+        assert "/stable.tif" in excludes
+        history = Path(command[command.index("--backup-dir") + 1])
+        (history / "changed.tif").write_bytes(b"old!")
+        (history / "old.tif").write_bytes(b"older")
+        Path(command[command.index("--log-file") + 1]).write_text(
+            '{"level":"info","msg":"Copied (new)","object":"new.tif","size":3}\n'
+            '{"level":"info","msg":"Moved","object":"changed.tif","size":4}\n'
+            '{"level":"info","msg":"Copied (replaced)","object":"changed.tif","size":7}\n'
+            '{"level":"info","msg":"Moved","object":"old.tif","size":5}\n',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    plan = successful_plan(config)
+    plan = PlanResult(
+        plan.run_id, plan.status,
+        plan.items + (PlanItem("skipped_recent", "stable.tif", 5, "recent"),),
+        {**plan.counts, "skipped_recent": 1}, plan.byte_totals,
+        plan.catalogue_file_count, plan.catalogue_total_bytes,
+        plan.planned_transfer_files, plan.planned_transfer_bytes,
+        plan.planned_archive_files, plan.planned_archive_bytes, plan.manifest_path,
+    )
+    run_backup(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "backup-recent",
+        planner=lambda *args, **kwargs: plan,
+        safety_checker=lambda *args, **kwargs: APPROVED,
+    )
+    with Ledger(config.ledger_path) as ledger:
+        row = ledger.connection.execute(
+            "SELECT size, mtime_ns FROM known_good_files WHERE relative_path='stable.tif'"
+        ).fetchone()
+        assert tuple(row) == (4, 0)
+        state = ledger.known_good_state()
+        assert state["catalogue_file_count"] == 3
+        assert state["catalogue_total_bytes"] == 14
+
+
+def test_skipped_recent_is_not_expected_execution_or_divergence(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    plan = successful_plan(config)
+    recent_only = PlanResult(
+        plan.run_id, plan.status,
+        (PlanItem("skipped_recent", "recent.tif", 6, "recent"),),
+        {name: (1 if name == "skipped_recent" else 0) for name in plan.counts},
+        {}, 1, 6, 0, 0, 0, 0, plan.manifest_path,
+    )
+    assert reconcile_execution(recent_only, []) == ()
 
 
 def test_execution_log_is_machine_readable_and_rejects_ambiguous_events() -> None:

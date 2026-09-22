@@ -11,6 +11,7 @@ from gorbackup.backup import BackupError, run_backup
 from gorbackup.config import ConfigError, load_config
 from gorbackup.dependencies import DependencyError, check_rclone
 from gorbackup.ledger import LedgerError, scan_catalogue
+from gorbackup.locking import LockError
 from gorbackup.planner import PlanError, create_plan
 from gorbackup.preflight import PreflightError, run_preflight
 from gorbackup.safety import SafetyError
@@ -125,6 +126,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         PlanError,
         BackupError,
         SafetyError,
+        LockError,
     ) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2

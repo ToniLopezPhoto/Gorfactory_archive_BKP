@@ -390,7 +390,7 @@ class Ledger:
         return dict(row) if row is not None else None
 
     def promote_known_good(self, run_id: str) -> None:
-        """Promote only a fully published, exactly reconciled backup."""
+        """Promote the protected snapshot, retaining old metadata for recent files."""
         row = self.connection.execute(
             """SELECT executions.plan_run_id, runs.catalogue_file_count,
                       runs.catalogue_total_bytes, runs.completed_at
@@ -400,19 +400,46 @@ class Ledger:
         ).fetchone()
         if row is None:
             raise LedgerError(f"run is not eligible for known-good promotion: {run_id}")
+        recent_paths = {
+            item["path"] for item in self.connection.execute(
+                "SELECT path FROM plan_items WHERE run_id=? AND category='skipped_recent'",
+                (row["plan_run_id"],),
+            )
+        }
+        previous = {
+            item["relative_path"]: tuple(item)
+            for item in self.connection.execute(
+                "SELECT relative_path, size, mtime_ns, checksum FROM known_good_files"
+            )
+        }
+        planned = {
+            item["relative_path"]: tuple(item)
+            for item in self.connection.execute(
+                "SELECT relative_path, size, mtime_ns, checksum FROM plan_catalogue_files WHERE run_id=?",
+                (row["plan_run_id"],),
+            )
+            if item["relative_path"] not in recent_paths
+        }
+        protected = dict(planned)
+        for path in recent_paths:
+            if path in previous:
+                protected[path] = previous[path]
+        protected_count = len(protected)
+        protected_bytes = sum(int(item[1]) for item in protected.values())
         with self.connection:
             self.connection.execute("DELETE FROM known_good_files")
-            self.connection.execute(
-                """INSERT INTO known_good_files (relative_path, size, mtime_ns, checksum, promoted_by_run_id)
-                   SELECT relative_path, size, mtime_ns, checksum, ?
-                   FROM plan_catalogue_files WHERE run_id=?""", (run_id, row["plan_run_id"]),
+            self.connection.executemany(
+                """INSERT INTO known_good_files
+                   (relative_path, size, mtime_ns, checksum, promoted_by_run_id)
+                   VALUES (?, ?, ?, ?, ?)""",
+                ((*item, run_id) for item in protected.values()),
             )
             self.connection.execute(
                 """INSERT INTO known_good_state (singleton, run_id, catalogue_file_count, catalogue_total_bytes, promoted_at)
                    VALUES (1, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET
                    run_id=excluded.run_id, catalogue_file_count=excluded.catalogue_file_count,
                    catalogue_total_bytes=excluded.catalogue_total_bytes, promoted_at=excluded.promoted_at""",
-                (run_id, row["catalogue_file_count"], row["catalogue_total_bytes"], row["completed_at"]),
+                (run_id, protected_count, protected_bytes, row["completed_at"]),
             )
 
     def invalidate_completed_run(self, run_id: str, error: str) -> None:

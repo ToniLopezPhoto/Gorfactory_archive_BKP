@@ -344,11 +344,17 @@ def create_plan(
                     )
                 )
             cutoff = started - timedelta(minutes=config.safety.ignore_recent_minutes)
-            items.extend(
-                find_recent_files(
-                    config.source.path, config.source.marker_file, cutoff
-                )
+            recent_items = find_recent_files(
+                config.source.path, config.source.marker_file, cutoff
             )
+            recent_paths = {item.path for item in recent_items}
+            # Do not trust rclone's report to be the sole expression of the
+            # grace window.  A recent source path cannot also be actionable.
+            items = [
+                item for item in items
+                if item.category == "error" or item.path not in recent_paths
+            ]
+            items.extend(recent_items)
             items = _classify_rename_candidates(items, config.source.path, current)
             if completed.returncode != 0 and not log_errors:
                 detail = (completed.stderr or completed.stdout).strip()

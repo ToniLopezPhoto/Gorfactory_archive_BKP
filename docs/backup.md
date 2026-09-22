@@ -1,11 +1,51 @@
 # Versioned execution and reconciliation
 
-`gorbackup backup` creates a fresh immutable plan, applies the safety gates below,
+After CLI preflight, `gorbackup backup` atomically acquires
+`<archive>/state/backup.lock`, creates a fresh immutable plan, applies the safety gates below,
 persists the assessment, reserves a unique history directory, and only then runs
 real rclone.
 Displaced files are directed to `history/<backup-run-id>/`; the source marker and
 recent-file window remain excluded. Tests and CI use only synthetic temporary
 trees and fake rclone reports.
+
+## Single-run lock
+
+The lock is held from before planning until execution, reconciliation, manifest
+publication, and known-good promotion have finished. It is released by a context
+manager on success, a safety block, rclone/reconciliation failure, manifest
+failure, or an unexpected exception. Thus two `backup` processes cannot reach a
+real `rclone sync` concurrently. Standalone read-only/preparatory commands are not
+locked; future mutable restore or prune operations must reuse this mechanism when
+they are implemented. `baseline --reconcile` remains outside the scope of this
+lock in the current release.
+
+The JSON lock records schema version, PID, hostname, acquisition timestamp,
+attempt identifier, and a random ownership token. Creation uses exclusive
+filesystem creation rather than an existence check. A contender on the same host
+checks the PID without signalling it: an existing or permission-protected PID is
+active regardless of lock age, while a nonexistent PID is stale and may be
+recovered. A different hostname is unverifiable and therefore fails closed.
+Corrupt locks also fail closed and must be investigated, never silently removed.
+Release verifies the ownership token (and file identity), so an old process cannot
+delete a replacement lock. Lock contention returns a non-zero operational error
+with owner PID, hostname, and timestamp, and creates no ledger run because the
+contender never obtained backup ownership.
+
+## Recent-file grace window
+
+`safety.ignore_recent_minutes` is applied only to regular source files, never to
+directories. The plan explicitly emits each such file as `skipped_recent` and
+removes it from actionable transfer/archive operations in addition to passing
+the equivalent `--min-age` filter to rclone. An old sibling in the same directory
+remains eligible. Skipped paths therefore neither transfer nor create false
+reconciliation divergence, and become eligible on a later run after aging beyond
+the cutoff.
+
+A successful run may contain skipped recent files. Known-good promotion excludes
+a new skipped path and retains the previous known-good metadata for a skipped
+path that was already protected. It never promotes the recent source metadata as
+backed up; known-good counts and bytes describe the merged, actually protected
+snapshot.
 
 ## Safety gates
 

@@ -208,3 +208,60 @@ def test_plan_fails_if_catalogue_changes_during_dry_run(tmp_path: Path) -> None:
 
     assert result.status == "failed"
     assert any("changed while" in item.reason for item in result.items)
+
+
+def test_recent_file_is_explicit_not_actionable_and_old_sibling_is_eligible(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    folder = config.source.path / "shoot"
+    folder.mkdir()
+    recent = folder / "recent.tif"
+    old = folder / "old.tif"
+    recent.write_bytes(b"recent")
+    old.write_bytes(b"old")
+    recent_ns = int(FIXED_TIME.timestamp() * 1_000_000_000)
+    old_ns = recent_ns - 60 * 60 * 1_000_000_000
+    os.utime(recent, ns=(recent_ns, recent_ns))
+    os.utime(old, ns=(old_ns, old_ns))
+
+    def runner(command, **kwargs):
+        Path(command[command.index("--combined") + 1]).write_text(
+            "+ shoot/recent.tif\n+ shoot/old.tif\n", encoding="utf-8"
+        )
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "recent-plan",
+    )
+    assert [(item.category, item.path) for item in result.items] == [
+        ("new_file", "shoot/old.tif"),
+        ("skipped_recent", "shoot/recent.tif"),
+    ]
+    assert result.planned_transfer_files == 1
+
+
+def test_recent_file_becomes_eligible_after_grace_window(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    recent = config.source.path / "recent.tif"
+    recent.write_bytes(b"recent")
+    timestamp = int(FIXED_TIME.timestamp() * 1_000_000_000)
+    os.utime(recent, ns=(timestamp, timestamp))
+
+    def runner(command, **kwargs):
+        Path(command[command.index("--combined") + 1]).write_text(
+            "+ recent.tif\n", encoding="utf-8"
+        )
+        Path(command[command.index("--log-file") + 1]).write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    later = datetime.fromtimestamp(FIXED_TIME.timestamp() + 16 * 60, timezone.utc)
+    result = create_plan(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=runner,
+        now=lambda: later, run_id_factory=lambda: "aged-plan",
+    )
+    assert [(item.category, item.path) for item in result.items] == [
+        ("new_file", "recent.tif")
+    ]
