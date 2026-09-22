@@ -62,7 +62,7 @@ def test_backup_runs_preflight(
     monkeypatch.setattr("gorbackup.cli.load_baseline_summary", lambda config: None)
     monkeypatch.setattr(
         "gorbackup.cli.run_backup",
-        lambda *args: BackupResult(
+        lambda *args, **kwargs: BackupResult(
             "backup-1",
             "plan-1",
             "success",
@@ -103,6 +103,49 @@ def test_preflight_failure_returns_nonzero(
 
     assert main(["--config", "unused.yaml", "backup"]) == 2
     assert "wrong archive disk" in capsys.readouterr().err
+
+
+def test_override_never_bypasses_critical_preflight(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: object())
+    monkeypatch.setattr(
+        "gorbackup.cli.check_rclone", lambda: SimpleNamespace(version=(1, 70, 0))
+    )
+    monkeypatch.setattr(
+        "gorbackup.cli.run_preflight",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PreflightError(["source identity mismatch"])
+        ),
+    )
+    monkeypatch.setattr(
+        "gorbackup.cli.run_backup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("backup must not start")
+        ),
+    )
+
+    assert main(["--config", "unused.yaml", "backup", "--override-safety"]) == 2
+    assert "source identity mismatch" in capsys.readouterr().err
+
+
+def test_override_is_rejected_in_unattended_cli(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: object())
+    monkeypatch.setattr(
+        "gorbackup.cli.check_rclone", lambda: SimpleNamespace(version=(1, 70, 0))
+    )
+    monkeypatch.setattr("gorbackup.cli.run_preflight", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "gorbackup.cli.run_backup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("backup must not start")
+        ),
+    )
+
+    assert main(["--config", "unused.yaml", "backup", "--override-safety"]) == 2
+    assert "manual-only" in capsys.readouterr().err
 
 
 def test_baseline_command_adopts_verified_dump(

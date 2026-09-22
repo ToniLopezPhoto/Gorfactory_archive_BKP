@@ -24,6 +24,13 @@ safety:
   ignore_recent_minutes: 5
   min_source_size_gb: 1
   min_source_size_ratio: 0.8
+  max_source_file_count_drop: 100
+  max_source_file_count_drop_percent: 12
+  max_source_bytes_drop_gb: 20
+  max_source_bytes_drop_percent: 8
+  max_changed_files_per_run: 1000
+  max_changed_bytes_gb: 100
+  max_changed_catalogue_percent: 15
 retention:
   auto_prune: false
 """
@@ -39,6 +46,8 @@ def test_load_config_does_not_require_configured_paths(tmp_path: Path) -> None:
     assert config.source.mount_path == Path("/source-mount")
     assert config.archive.root == Path("/archive")
     assert config.safety.max_delete_size_gb == 2.5
+    assert config.safety.max_source_file_count_drop_percent == 12
+    assert config.safety.max_changed_catalogue_percent == 15
     assert config.retention.auto_prune is False
     assert config.state.baseline_manifest == "baseline.json"
     assert config.state.ledger_file == "gorbackup.sqlite3"
@@ -70,4 +79,14 @@ def test_invalid_threshold_is_rejected(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigError, match="must not exceed 100"):
+        load_config(path)
+
+
+def test_invalid_change_percentage_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        VALID_CONFIG.replace("max_changed_catalogue_percent: 15", "max_changed_catalogue_percent: 101"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="max_changed_catalogue_percent.*must not exceed 100"):
         load_config(path)

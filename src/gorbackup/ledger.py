@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from gorbackup.config import AppConfig
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class LedgerError(RuntimeError):
@@ -46,7 +46,7 @@ CREATE TABLE runs (
     operation TEXT NOT NULL CHECK (operation IN ('scan', 'plan', 'backup')),
     started_at TEXT NOT NULL,
     completed_at TEXT,
-    status TEXT NOT NULL CHECK (status IN ('running', 'success', 'warning', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('running', 'blocked', 'success', 'warning', 'failed')),
     source_identity TEXT NOT NULL,
     destination_identity TEXT NOT NULL,
     catalogue_file_count INTEGER NOT NULL DEFAULT 0,
@@ -120,6 +120,16 @@ CREATE TABLE executions (
     reconciliation_status TEXT NOT NULL CHECK
         (reconciliation_status IN ('exact', 'diverged', 'failed'))
 );
+CREATE TABLE safety_assessments (
+    run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+    plan_run_id TEXT NOT NULL REFERENCES plans(run_id),
+    assessment_json TEXT NOT NULL,
+    failed_gates_json TEXT NOT NULL,
+    override_requested INTEGER NOT NULL CHECK (override_requested IN (0, 1)),
+    override_used INTEGER NOT NULL CHECK (override_used IN (0, 1)),
+    overridden_gates_json TEXT NOT NULL,
+    message TEXT NOT NULL
+);
 CREATE TABLE execution_items (
     item_id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL REFERENCES executions(run_id) ON DELETE CASCADE,
@@ -159,12 +169,14 @@ CREATE INDEX idx_runs_status_completed ON runs(status, completed_at DESC);
 CREATE INDEX idx_plan_items_run_category ON plan_items(run_id, category);
 CREATE INDEX idx_execution_items_run_operation ON execution_items(run_id, operation);
 CREATE INDEX idx_reconciliation_items_run ON reconciliation_items(run_id);
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 """
 
 _V1_TABLES = (
-    "backup_runs", "file_changes", "current_files", "staged_files", "plan_items",
-    "plans", "runs",
+    "safety_assessments", "reconciliation_items", "execution_items", "executions",
+    "known_good_state", "known_good_files", "plan_catalogue_files", "catalogue_changes",
+    "staged_catalogue_files", "catalogue_files", "backup_runs", "file_changes",
+    "current_files", "staged_files", "plan_items", "plans", "runs",
 )
 
 
@@ -214,9 +226,9 @@ class Ledger:
         has_runs = self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
         ).fetchone()
-        if version not in (0, SCHEMA_VERSION):
+        if version not in (0, 1, 2, SCHEMA_VERSION):
             raise LedgerError(f"unsupported ledger schema version: {version}")
-        if version == 0 and has_runs:
+        if version in (1, 2) or (version == 0 and has_runs):
             self._migrate_v1()
         elif not has_runs:
             self.connection.executescript(SCHEMA)
@@ -332,6 +344,50 @@ class Ledger:
             )
             if cursor.rowcount != 1:
                 raise LedgerError(f"run is not active: {run_id}")
+
+    def record_safety_assessment(
+        self, run_id: str, plan_run_id: str, assessment: Dict[str, object],
+        failed_gates: Sequence[str], *, override_requested: bool,
+        override_used: bool, overridden_gates: Sequence[str], message: str,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO safety_assessments
+                   (run_id, plan_run_id, assessment_json, failed_gates_json,
+                    override_requested, override_used, overridden_gates_json, message)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, plan_run_id, json.dumps(assessment, sort_keys=True),
+                 json.dumps(list(failed_gates)), int(override_requested),
+                 int(override_used), json.dumps(list(overridden_gates)), message),
+            )
+
+    def block_run(self, run_id: str, completed_at: str, plan_run_id: str,
+                  error: str) -> None:
+        plan = self.connection.execute(
+            """SELECT catalogue_file_count, catalogue_total_bytes,
+                      planned_transfer_files, planned_transfer_bytes,
+                      planned_archive_files, planned_archive_bytes
+               FROM runs WHERE run_id=? AND operation='plan'""", (plan_run_id,),
+        ).fetchone()
+        if plan is None:
+            raise LedgerError(f"plan does not exist: {plan_run_id}")
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE runs SET completed_at=?, status='blocked',
+                   catalogue_file_count=?, catalogue_total_bytes=?,
+                   planned_transfer_files=?, planned_transfer_bytes=?,
+                   planned_archive_files=?, planned_archive_bytes=?, errors_json=?
+                   WHERE run_id=? AND status='running'""",
+                (completed_at, *tuple(plan), json.dumps([error]), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise LedgerError(f"run is not active: {run_id}")
+
+    def safety_assessment(self, run_id: str) -> Optional[Dict[str, object]]:
+        row = self.connection.execute(
+            "SELECT * FROM safety_assessments WHERE run_id=?", (run_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     def promote_known_good(self, run_id: str) -> None:
         """Promote only a fully published, exactly reconciled backup."""

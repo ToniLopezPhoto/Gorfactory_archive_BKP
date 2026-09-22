@@ -14,7 +14,14 @@ from gorbackup.config import AppConfig
 from gorbackup.dependencies import RcloneInfo
 from gorbackup.ledger import Ledger, validate_state_location
 from gorbackup.planner import PlanResult, _atomic_json, create_plan
-from gorbackup.safety import SafetyAssessment, assess_plan_safety
+from gorbackup.baseline import load_baseline_summary
+from gorbackup.safety import (
+    OVERRIDABLE_GATES,
+    SafetyAssessment,
+    SafetyError,
+    SafetyReference,
+    assess_plan_safety,
+)
 
 
 class BackupError(RuntimeError):
@@ -237,13 +244,62 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
                now: Callable[[], datetime] = _utc_now,
                run_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
                planner: Callable[..., PlanResult] = create_plan,
-               safety_checker: Callable[..., SafetyAssessment] = assess_plan_safety) -> BackupResult:
+               safety_checker: Callable[..., SafetyAssessment] = assess_plan_safety,
+               override_safety: bool = False,
+               manual_context: bool = False) -> BackupResult:
+    if override_safety and not manual_context:
+        raise BackupError("--override-safety requires an interactive manual session")
     validate_state_location(config)
     plan = planner(config, rclone, runner=runner, now=now)
     if plan.status != "success":
         raise BackupError(f"refusing to execute failed plan: {plan.run_id}")
-    safety = safety_checker(config, plan)
     run_id, started_at = run_id_factory(), now()
+    with Ledger(config.ledger_path) as ledger:
+        known_good = ledger.known_good_state()
+        if known_good is not None:
+            reference = SafetyReference(
+                "known_good", str(known_good["run_id"]),
+                int(known_good["catalogue_file_count"]),
+                int(known_good["catalogue_total_bytes"]),
+            )
+        else:
+            baseline = load_baseline_summary(config)
+            reference = (
+                SafetyReference("baseline", None, baseline.file_count, baseline.total_size_bytes)
+                if baseline is not None else None
+            )
+        ledger.start_run(run_id, started_at.isoformat(), config.source.marker_id,
+                         config.archive.marker_id, operation="backup")
+        try:
+            safety = safety_checker(config, plan, reference=reference)
+        except SafetyError as exc:
+            assessment = exc.assessment
+            failures = assessment.failures if assessment is not None else ()
+            failed_gates = [item.gate for item in failures]
+            non_overridable = [item for item in failures if not item.overridable]
+            can_override = bool(failures) and not non_overridable and set(failed_gates) <= OVERRIDABLE_GATES
+            override_used = override_safety and manual_context and can_override
+            payload = asdict(assessment) if assessment is not None else {"reasons": list(exc.reasons)}
+            message = (
+                "manual safety override accepted: " + ", ".join(failed_gates)
+                if override_used else str(exc)
+            )
+            ledger.record_safety_assessment(
+                run_id, plan.run_id, payload, failed_gates,
+                override_requested=override_safety, override_used=override_used,
+                overridden_gates=failed_gates if override_used else (), message=message,
+            )
+            if not override_used:
+                ledger.block_run(run_id, now().isoformat(), plan.run_id, message)
+                raise
+            safety = assessment
+        else:
+            ledger.record_safety_assessment(
+                run_id, plan.run_id, asdict(safety), (),
+                override_requested=override_safety, override_used=False,
+                overridden_gates=(), message="all safety gates passed",
+            )
+
     current = config.archive.root / config.archive.current_dir
     history_path = config.archive.root / config.archive.history_dir / run_id
     try:
@@ -269,8 +325,6 @@ def run_backup(config: AppConfig, rclone: RcloneInfo, *,
         command.extend(["--min-age", f"{config.safety.ignore_recent_minutes}m"])
 
     with Ledger(config.ledger_path) as ledger:
-        ledger.start_run(run_id, started_at.isoformat(), config.source.marker_id,
-                         config.archive.marker_id, operation="backup")
         try:
             completed = runner(command, check=False, capture_output=True, text=True)
             executed, log_warnings, log_errors = parse_execution_log(log_path.read_text(encoding="utf-8").splitlines())

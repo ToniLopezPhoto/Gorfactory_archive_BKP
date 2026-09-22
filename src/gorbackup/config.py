@@ -36,6 +36,13 @@ class SafetyConfig:
     ignore_recent_minutes: int
     min_source_size_gb: float
     min_source_size_ratio: float
+    max_source_file_count_drop: int = 500
+    max_source_file_count_drop_percent: float = 10.0
+    max_source_bytes_drop_gb: float = 50.0
+    max_source_bytes_drop_percent: float = 10.0
+    max_changed_files_per_run: int = 2000
+    max_changed_bytes_gb: float = 200.0
+    max_changed_catalogue_percent: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -182,6 +189,24 @@ def load_config(path: Path) -> AppConfig:
     if source_ratio > 1:
         raise ConfigError("'safety.min_source_size_ratio' must not exceed 1")
 
+    integer_thresholds = {
+        "max_source_file_count_drop": safety.get("max_source_file_count_drop", 500),
+        "max_changed_files_per_run": safety.get("max_changed_files_per_run", 2000),
+    }
+    for key, value in integer_thresholds.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"'safety.{key}' must be an integer")
+        _positive_number(value, f"safety.{key}", allow_zero=True)
+    percent_thresholds = {
+        "max_source_file_count_drop_percent": safety.get("max_source_file_count_drop_percent", 10),
+        "max_source_bytes_drop_percent": safety.get("max_source_bytes_drop_percent", 10),
+        "max_changed_catalogue_percent": safety.get("max_changed_catalogue_percent", 25),
+    }
+    for key, value in percent_thresholds.items():
+        percent = _positive_number(value, f"safety.{key}", allow_zero=True)
+        if percent > 100:
+            raise ConfigError(f"'safety.{key}' must not exceed 100")
+
     auto_prune = _required(retention, "retention", "auto_prune")
     if not isinstance(auto_prune, bool):
         raise ConfigError("'retention.auto_prune' must be true or false")
@@ -247,6 +272,19 @@ def load_config(path: Path) -> AppConfig:
                 allow_zero=True,
             ),
             min_source_size_ratio=source_ratio,
+            max_source_file_count_drop=integer_thresholds["max_source_file_count_drop"],
+            max_source_file_count_drop_percent=float(percent_thresholds["max_source_file_count_drop_percent"]),
+            max_source_bytes_drop_gb=_positive_number(
+                safety.get("max_source_bytes_drop_gb", 50),
+                "safety.max_source_bytes_drop_gb", allow_zero=True,
+            ),
+            max_source_bytes_drop_percent=float(percent_thresholds["max_source_bytes_drop_percent"]),
+            max_changed_files_per_run=integer_thresholds["max_changed_files_per_run"],
+            max_changed_bytes_gb=_positive_number(
+                safety.get("max_changed_bytes_gb", 200),
+                "safety.max_changed_bytes_gb", allow_zero=True,
+            ),
+            max_changed_catalogue_percent=float(percent_thresholds["max_changed_catalogue_percent"]),
         ),
         retention=RetentionConfig(auto_prune=auto_prune),
         logging=LoggingConfig(level.upper(), Path(directory), keep_days),

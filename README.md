@@ -27,8 +27,9 @@ not be committed. The example paths are illustrative only.
 
 Every operational command validates the configuration and the installed
 `rclone` version. `backup` additionally runs read-only safety checks and a fresh
-plan, enforces deletion and projected-capacity limits, then repeats deletion
-limits inside rclone before syncing; it never writes to the source. The
+plan, enforces deletion, known-good shrink, high-change-volume, and projected-
+capacity limits, then repeats deletion limits inside rclone before syncing; it
+never writes to the source. Blocked assessments are retained in the ledger. The
 configured identity markers and archive directories must be provisioned by an operator.
 See [docs/configuration.md](docs/configuration.md) for the available settings.
 

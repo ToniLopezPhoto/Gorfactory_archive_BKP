@@ -18,6 +18,15 @@ safety:
   ignore_recent_minutes: 15
   min_source_size_gb: 3500
   min_source_size_ratio: 0.8
+  # Compared with latest known-good; baseline is used only before the first success.
+  max_source_file_count_drop: 500
+  max_source_file_count_drop_percent: 10
+  max_source_bytes_drop_gb: 50
+  max_source_bytes_drop_percent: 10
+  # Count includes new, modified, and rename/move candidates.
+  max_changed_files_per_run: 2000
+  max_changed_bytes_gb: 200
+  max_changed_catalogue_percent: 25
 
 retention:
   auto_prune: false
