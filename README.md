@@ -92,6 +92,17 @@ gorbackup --config config/config.yaml verify project/photo.tif
 The path must be relative; omitting it is an error so a multi-terabyte full scan
 cannot start accidentally. See [docs/backup.md](docs/backup.md#manual-selected-path-verification).
 
+To discover and recover an older version without writing to the SAM or current
+mirror:
+
+```sh
+gorbackup --config config/config.yaml history "Campaign/photo.tif"
+gorbackup --config config/config.yaml restore "Campaign/photo.tif" --run <run_id>
+```
+
+See [docs/recovery.md](docs/recovery.md) for destination restrictions,
+verification, conflicts, and restore evidence.
+
 ## Development
 
 ```sh

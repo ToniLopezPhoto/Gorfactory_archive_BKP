@@ -9,6 +9,7 @@ from gorbackup.baseline import BaselineResult, ComparisonReport
 from gorbackup.ledger import ScanResult
 from gorbackup.planner import PlanResult
 from gorbackup.preflight import PreflightError, PreflightResult, SourceSummary
+from gorbackup.recovery import HistoryResult, HistoryVersion, RestoreResult
 from gorbackup.safety import SafetyAssessment
 
 
@@ -17,7 +18,7 @@ from gorbackup.safety import SafetyAssessment
     [
         item
         for item in COMMANDS
-        if item not in {"backup", "baseline", "scan", "plan", "verify"}
+        if item not in {"backup", "baseline", "scan", "plan", "verify", "history", "restore"}
     ],
 )
 def test_placeholder_commands_validate_without_touching_paths(
@@ -282,3 +283,51 @@ def test_verify_command_returns_success_and_failure(
     (archive / "current" / "photo.tif").write_bytes(b"oops")
     assert main(["--config", "unused.yaml", "verify", "photo.tif"]) == 2
     assert "verify: failed" in capsys.readouterr().out
+
+
+def test_history_cli_is_read_only_and_does_not_require_rclone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = object()
+    result = HistoryResult(
+        "Campaign/photo.tif",
+        HistoryVersion("current", None, None, None, 3, None, "current", Path("current"), True),
+        (HistoryVersion(
+            "history", "run-1", "2026-09-20T12:00:00+00:00", "success",
+            4, None, "overwritten", Path("history"), False,
+        ),),
+    )
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "gorbackup.cli.check_rclone",
+        lambda: (_ for _ in ()).throw(AssertionError("rclone must not be checked")),
+    )
+    monkeypatch.setattr("gorbackup.cli.find_history", lambda *args: result)
+
+    assert main(["--config", "unused.yaml", "history", "Campaign/photo.tif"]) == 0
+    output = capsys.readouterr().out
+    assert "run run-1" in output
+    assert "recorded but missing" in output
+
+
+def test_restore_cli_reports_verified_destination_without_rclone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = object()
+    result = RestoreResult(
+        "restore-1", "photo.tif", "run-1", Path("history/photo.tif"),
+        Path("recovery/restore-1/photo.tif"), 4, "abcd", "sha256",
+    )
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "gorbackup.cli.check_rclone",
+        lambda: (_ for _ in ()).throw(AssertionError("rclone must not be checked")),
+    )
+    monkeypatch.setattr("gorbackup.cli.restore_version", lambda *args, **kwargs: result)
+
+    assert main([
+        "--config", "unused.yaml", "restore", "photo.tif", "--run", "run-1"
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "restore: success" in output
+    assert "checksum=sha256:abcd" in output
