@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -14,8 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Python ${{ matrix.python-version }}
+  linux:
+    name: Linux / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -42,3 +45,31 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest
+
+  macos-production:
+    name: macOS production smoke
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and test dependencies
+        run: python -m pip install --disable-pip-version-check -e '.[dev]'
+
+      - name: Compile package and tests
+        run: python -m compileall -q src tests
+
+      - name: Run test suite
+        run: python -m pytest
+
+      - name: Prove native macOS rename-no-replace test executed
+        run: python -m pytest -vv tests/test_renames.py::test_real_macos_rename_no_replace

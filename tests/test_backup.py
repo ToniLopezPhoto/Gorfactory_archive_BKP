@@ -27,13 +27,23 @@ from gorbackup.ledger import FileMetadata, Ledger
 from gorbackup.locking import BackupLock, LockError
 from gorbackup.planner import PlanItem, PlanResult
 from gorbackup.renames import (
-    BackendCapabilities, RenameCapabilities, RenameStateAmbiguous,
+    BackendCapabilities, RenameCapabilities, RenameOptimizationUnavailable,
+    RenameStateAmbiguous,
 )
 from gorbackup.safety import GateFailure, SafetyAssessment, SafetyError
 from gorbackup.verification import VerificationItem, VerificationResult
 
 FIXED_TIME = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
 APPROVED = SafetyAssessment(1, 5, 10, 100, 90, 90.0)
+
+
+def safe_test_rename_executor(current: Path, proven) -> None:
+    """Fixture-only atomic no-overwrite move, independent of platform APIs."""
+    old = current / proven.old_path
+    new = current / proven.new_path
+    new.parent.mkdir(parents=True, exist_ok=True)
+    os.link(old, new)  # Atomic EEXIST without replacing destination.
+    old.unlink()
 
 
 def successful_verifier(source, destination, transfers, **kwargs):
@@ -208,6 +218,7 @@ def test_proven_rename_has_zero_transfer_bytes_and_promotes_new_path(tmp_path: P
         planner=lambda *args, **kwargs: plan,
         safety_checker=lambda *args, **kwargs: APPROVED,
         capability_prober=lambda *args, **kwargs: capabilities,
+        rename_executor=safe_test_rename_executor,
     )
     assert result.executed_transfer_bytes == 0
     assert result.executed_rename_files == 1
@@ -217,6 +228,61 @@ def test_proven_rename_has_zero_transfer_bytes_and_promotes_new_path(tmp_path: P
     with Ledger(config.ledger_path) as ledger:
         assert ledger.current_version(item.related_path) is None
         assert ledger.current_version(item.path)["checksum"].startswith("sha256:")
+
+
+def test_unavailable_rename_falls_back_and_removes_journal(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    source = config.source.path / "new.tif"
+    old = config.archive.root / "current" / "old.tif"
+    source.write_bytes(b"pixels"); old.write_bytes(b"pixels")
+    source_stat = source.stat()
+    item = PlanItem("rename_move_candidate", "new.tif", 6, "candidate", "old.tif", 6)
+    counts = {name: int(name == "rename_move_candidate") for name in (
+        "new_file", "changed_file", "delete_from_current",
+        "rename_move_candidate", "skipped_recent", "error",
+    )}
+    totals = {name: (6 if name == "rename_move_candidate" else 0) for name in counts}
+    plan = PlanResult("fallback-plan", "success", (item,), counts, totals, 1, 6,
+                      0, 0, 0, 0, config.manifests_root / "plan.json", 1, 6)
+    with Ledger(config.ledger_path) as ledger:
+        ledger.start_run("fallback-plan", FIXED_TIME.isoformat(), "source-id", "archive-id", "plan")
+        ledger.save_plan(
+            "fallback-plan", FIXED_TIME.isoformat(), "success",
+            [{"category": item.category, "path": item.path, "related_path": item.related_path,
+              "size": 6, "leaving_size": 6, "reason": item.reason}],
+            counts, totals, [], [], [FileMetadata("new.tif", 6, source_stat.st_mtime_ns)],
+        )
+    local = BackendCapabilities("local", frozenset({"sha1"}), True, True)
+    capabilities = RenameCapabilities(local, local, frozenset({"sha1"}), True)
+
+    def fallback_runner(command, **kwargs):
+        history = Path(command[command.index("--backup-dir") + 1])
+        (history / "old.tif").write_bytes(old.read_bytes())
+        old.unlink()
+        (config.archive.root / "current" / "new.tif").write_bytes(source.read_bytes())
+        Path(command[command.index("--log-file") + 1]).write_text(
+            '{"level":"info","msg":"Moved","object":"old.tif","size":6}\n'
+            '{"level":"info","msg":"Copied (new)","object":"new.tif","size":6}\n',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = run_backup(
+        config, RcloneInfo("rclone", (1, 70, 0)), runner=fallback_runner,
+        now=lambda: FIXED_TIME, run_id_factory=lambda: "fallback-run",
+        planner=lambda *args, **kwargs: plan,
+        safety_checker=lambda *args, **kwargs: APPROVED,
+        capability_prober=lambda *args, **kwargs: capabilities,
+        rename_executor=lambda *args: (_ for _ in ()).throw(
+            RenameOptimizationUnavailable("primitive unavailable")
+        ),
+    )
+    assert result.status == "success"
+    assert result.executed_rename_files == 0
+    assert result.executed_transfer_files == 1
+    assert result.executed_transfer_bytes == 6
+    assert result.verification.verified_files == 1
+    assert not (config.state_root / ".rename-journal-fallback-run.json").exists()
 
 
 def test_ambiguous_rename_fails_run_and_retains_journal(tmp_path: Path) -> None:
