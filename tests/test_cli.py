@@ -291,7 +291,10 @@ def test_history_cli_is_read_only_and_does_not_require_rclone(
     config = object()
     result = HistoryResult(
         "Campaign/photo.tif",
-        HistoryVersion("current", None, None, None, 3, None, "current", Path("current"), True),
+        HistoryVersion(
+            "current", None, None, None, 3, None, "current", Path("current"),
+            True, "differs_from_known_good",
+        ),
         (HistoryVersion(
             "history", "run-1", "2026-09-20T12:00:00+00:00", "success",
             4, None, "overwritten", Path("history"), False,
@@ -308,6 +311,7 @@ def test_history_cli_is_read_only_and_does_not_require_rclone(
     output = capsys.readouterr().out
     assert "run run-1" in output
     assert "recorded but missing" in output
+    assert "differs_from_known_good" in output
 
 
 def test_restore_cli_reports_verified_destination_without_rclone(
