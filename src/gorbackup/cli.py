@@ -13,6 +13,7 @@ from gorbackup.dependencies import DependencyError, check_rclone
 from gorbackup.ledger import LedgerError, scan_catalogue
 from gorbackup.locking import LockError
 from gorbackup.planner import PlanError, create_plan
+from gorbackup.pruning import PruneError, execute_prune, plan_prune
 from gorbackup.preflight import PreflightError, run_preflight
 from gorbackup.recovery import RecoveryError, find_history, restore_version
 from gorbackup.safety import SafetyError
@@ -27,6 +28,7 @@ COMMANDS = (
     "verify",
     "history",
     "restore",
+    "prune",
     "audit",
 )
 
@@ -61,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
                 if command == "history"
                 else "copy one historical version into recovery staging"
                 if command == "restore"
+                else "plan or explicitly execute safe history retention"
+                if command == "prune"
                 else f"{command} operation (placeholder)"
             ),
             description=(
@@ -76,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
                 if command == "history"
                 else "Safely copy and verify a historical version without touching the source."
                 if command == "restore"
+                else "Create an immutable prune plan or execute exactly one reviewed plan."
+                if command == "prune"
                 else f"Validate prerequisites for the future {command} operation."
             ),
         )
@@ -108,6 +114,14 @@ def build_parser() -> argparse.ArgumentParser:
                 "--destination", type=Path, metavar="DIRECTORY",
                 help="explicit absolute staging root outside the archive",
             )
+        if command == "prune":
+            mode = subparser.add_mutually_exclusive_group(required=True)
+            mode.add_argument("--dry-run", action="store_true",
+                              help="persist a deterministic plan without deleting")
+            mode.add_argument("--execute", metavar="PRUNE_ID",
+                              help="execute exactly one persisted plan")
+            subparser.add_argument("--yes", action="store_true",
+                                   help="required explicit confirmation for execution")
     return parser
 
 
@@ -115,7 +129,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = load_config(args.config)
-        rclone = check_rclone() if args.command not in {"history", "restore"} else None
+        rclone = check_rclone() if args.command not in {"history", "restore", "prune"} else None
         preflight = None
         if args.command in {"backup", "baseline", "scan", "plan", "verify"}:
             baseline = (
@@ -157,6 +171,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             restore_result = restore_version(
                 config, args.path, args.run_id, destination=args.destination
             )
+        if args.command == "prune":
+            if args.dry_run:
+                if args.yes:
+                    raise PruneError("--yes is only valid with --execute")
+                prune_result = plan_prune(config)
+            else:
+                prune_result = execute_prune(config, args.execute, yes=args.yes)
     except (
         ConfigError,
         DependencyError,
@@ -169,6 +190,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LockError,
         VerificationError,
         RecoveryError,
+        PruneError,
     ) as exc:
         print(f"gorbackup: error: {exc}", file=sys.stderr)
         return 2
@@ -256,7 +278,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not history_result.versions:
             print("no archived versions recorded")
         for item in history_result.versions:
-            availability = "available" if item.exists else "recorded but missing"
+            availability = (
+                f"pruned {item.pruned_at} by prune {item.pruned_by}"
+                if item.pruned_by else "available" if item.exists else "recorded but missing"
+            )
             checksum = item.checksum or "checksum unavailable"
             print(
                 f"{item.timestamp} | run {item.run_id} | {item.size} bytes | "
@@ -271,6 +296,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"checksum=sha256:{restore_result.checksum}; "
             f"destination={restore_result.destination_path}"
         )
+        return 0
+
+    if args.command == "prune":
+        if prune_result.status == "planned":
+            print(
+                f"prune: planned; prune_id={prune_result.prune_id}; "
+                f"files={prune_result.files}; bytes_reclaimable={prune_result.bytes}; "
+                f"runs={prune_result.runs}; protected_versions={prune_result.protected_count}; "
+                f"oldest_candidate={prune_result.oldest_candidate}; "
+                f"newest_candidate={prune_result.newest_candidate}; "
+                f"free_percent={prune_result.free_before['free_percent']:.2f}; "
+                f"projected_free_percent={prune_result.free_projected['free_percent']:.2f}; "
+                f"manifest={prune_result.manifest_path}"
+            )
+        else:
+            print(
+                f"prune: {prune_result.status}; prune_id={prune_result.prune_id}; "
+                f"deleted_files={prune_result.files}; deleted_bytes={prune_result.bytes}; "
+                f"runs={prune_result.runs}; manifest={prune_result.manifest_path}"
+            )
         return 0
 
     version = ".".join(str(part) for part in rclone.version)

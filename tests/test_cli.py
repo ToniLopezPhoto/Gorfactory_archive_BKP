@@ -5,6 +5,7 @@ import pytest
 
 from gorbackup.cli import COMMANDS, main
 from gorbackup.backup import BackupResult
+from gorbackup.pruning import PruneResult
 from gorbackup.baseline import BaselineResult, ComparisonReport
 from gorbackup.ledger import ScanResult
 from gorbackup.planner import PlanResult
@@ -18,7 +19,7 @@ from gorbackup.safety import SafetyAssessment
     [
         item
         for item in COMMANDS
-        if item not in {"backup", "baseline", "scan", "plan", "verify", "history", "restore"}
+        if item not in {"backup", "baseline", "scan", "plan", "verify", "history", "restore", "prune"}
     ],
 )
 def test_placeholder_commands_validate_without_touching_paths(
@@ -335,3 +336,20 @@ def test_restore_cli_reports_verified_destination_without_rclone(
     output = capsys.readouterr().out
     assert "restore: success" in output
     assert "checksum=sha256:abcd" in output
+
+
+def test_prune_dry_run_reports_plan_without_rclone(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: object())
+    monkeypatch.setattr("gorbackup.cli.check_rclone", lambda: pytest.fail("no rclone"))
+    result = PruneResult("p1", "planned", 2, 30, 1, Path("plan.json"), 4,
+                         "2020-01-01", "2020-01-02",
+                         {"free_percent": 10.0}, {"free_percent": 11.0})
+    monkeypatch.setattr("gorbackup.cli.plan_prune", lambda config: result)
+    assert main(["--config", "unused.yaml", "prune", "--dry-run"]) == 0
+    assert "prune_id=p1" in capsys.readouterr().out
+
+
+def test_prune_execute_requires_yes(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("gorbackup.cli.load_config", lambda path: object())
+    assert main(["--config", "unused.yaml", "prune", "--execute", "p1"]) == 2
+    assert "requires explicit --yes" in capsys.readouterr().err

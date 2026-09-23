@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from gorbackup.config import AppConfig
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class LedgerError(RuntimeError):
@@ -197,13 +197,32 @@ CREATE TABLE restore_runs (
     error TEXT
 );
 
+CREATE TABLE prune_runs (
+    prune_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, executed_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ('planned','running','success','failed')),
+    policy_json TEXT NOT NULL, planned_files INTEGER NOT NULL,
+    planned_bytes INTEGER NOT NULL, deleted_files INTEGER NOT NULL DEFAULT 0,
+    deleted_bytes INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE prune_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prune_id TEXT NOT NULL REFERENCES prune_runs(prune_id),
+    source_run_id TEXT NOT NULL, relative_path TEXT NOT NULL,
+    historical_path TEXT NOT NULL, bytes INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL, device INTEGER, inode INTEGER, checksum TEXT,
+    status TEXT NOT NULL CHECK (status IN ('planned','deleted','skipped','failed')),
+    deleted_at TEXT, detail TEXT NOT NULL,
+    UNIQUE(prune_id, source_run_id, relative_path)
+);
+
 CREATE INDEX idx_runs_status_completed ON runs(status, completed_at DESC);
 CREATE INDEX idx_plan_items_run_category ON plan_items(run_id, category);
 CREATE INDEX idx_execution_items_run_operation ON execution_items(run_id, operation);
 CREATE INDEX idx_reconciliation_items_run ON reconciliation_items(run_id);
 CREATE INDEX idx_verification_items_run_status ON verification_items(run_id, status);
 CREATE INDEX idx_restore_runs_started ON restore_runs(started_at DESC);
-PRAGMA user_version = 6;
+CREATE INDEX idx_prune_items_version ON prune_items(source_run_id, relative_path, status);
+PRAGMA user_version = 7;
 """
 
 _V1_TABLES = (
@@ -264,14 +283,19 @@ class Ledger:
         has_runs = self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
         ).fetchone()
-        if version not in (0, 1, 2, 3, 4, 5, SCHEMA_VERSION):
+        if version not in (0, 1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
             raise LedgerError(f"unsupported ledger schema version: {version}")
         if read_only:
             if not has_runs:
                 raise LedgerError(f"ledger does not exist or is not initialized: {path}")
             return
+        if version == 6:
+            self._migrate_v6()
+            self.schema_version = SCHEMA_VERSION
+            return
         if version == 5:
             self._migrate_v5()
+            self._migrate_v6()
             self.schema_version = SCHEMA_VERSION
             return
         if version == 4:
@@ -281,6 +305,7 @@ class Ledger:
                 self._migrate_v5()
             else:
                 self.connection.execute("PRAGMA user_version = 6")
+            self._migrate_v6()
             self.schema_version = SCHEMA_VERSION
             return
         if version in (1, 2, 3) or (version == 0 and has_runs):
@@ -345,6 +370,38 @@ class Ledger:
                 DROP TABLE execution_items_v5;
                 CREATE INDEX idx_execution_items_run_operation ON execution_items(run_id, operation);
                 PRAGMA user_version = 6;
+                COMMIT;
+                """
+            )
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def _migrate_v6(self) -> None:
+        """Add deliberate-pruning evidence without changing backup records."""
+        try:
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS prune_runs (
+                    prune_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, executed_at TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('planned','running','success','failed')),
+                    policy_json TEXT NOT NULL, planned_files INTEGER NOT NULL,
+                    planned_bytes INTEGER NOT NULL, deleted_files INTEGER NOT NULL DEFAULT 0,
+                    deleted_bytes INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE IF NOT EXISTS prune_items (
+                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prune_id TEXT NOT NULL REFERENCES prune_runs(prune_id),
+                    source_run_id TEXT NOT NULL, relative_path TEXT NOT NULL,
+                    historical_path TEXT NOT NULL, bytes INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL, device INTEGER, inode INTEGER, checksum TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('planned','deleted','skipped','failed')),
+                    deleted_at TEXT, detail TEXT NOT NULL,
+                    UNIQUE(prune_id, source_run_id, relative_path)
+                );
+                CREATE INDEX IF NOT EXISTS idx_prune_items_version ON prune_items(source_run_id, relative_path, status);
+                PRAGMA user_version = 7;
                 COMMIT;
                 """
             )
@@ -660,13 +717,23 @@ class Ledger:
     def historical_versions(self, relative_path: str) -> List[Dict[str, object]]:
         """Return ledger-backed archive evidence newest first."""
         checksum_column = "ei.checksum" if self.schema_version >= 5 else "NULL AS checksum"
+        prune_columns = (
+            "pi.prune_id AS pruned_by, pi.deleted_at AS pruned_at"
+            if self.schema_version >= 7 else "NULL AS pruned_by, NULL AS pruned_at"
+        )
+        prune_join = (
+            "LEFT JOIN prune_items pi ON pi.source_run_id=ei.run_id "
+            "AND pi.relative_path=ei.path AND pi.status='deleted'"
+            if self.schema_version >= 7 else ""
+        )
         rows = self.connection.execute(
             f"""SELECT r.run_id, r.started_at, r.completed_at, r.status,
                       e.history_path, ei.path, ei.size, ei.classification,
-                      p.category AS plan_category, {checksum_column}
+                      p.category AS plan_category, {checksum_column}, {prune_columns}
                FROM execution_items ei
                JOIN executions e ON e.run_id=ei.run_id
                JOIN runs r ON r.run_id=ei.run_id
+               {prune_join}
                LEFT JOIN plan_items p ON p.run_id=e.plan_run_id
                     AND (p.path=ei.path OR p.related_path=ei.path)
                     AND p.category IN ('changed_file','delete_from_current','rename_move_candidate')
@@ -676,6 +743,88 @@ class Ledger:
             (relative_path,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def history_archive_items(self) -> List[Dict[str, object]]:
+        """Return every ledger-backed physical history version in stable order."""
+        return [dict(row) for row in self.connection.execute(
+            """SELECT r.run_id, r.started_at, r.completed_at, r.status,
+                      e.history_path, ei.path, ei.size, ei.checksum
+               FROM execution_items ei JOIN executions e ON e.run_id=ei.run_id
+               JOIN runs r ON r.run_id=ei.run_id
+               LEFT JOIN prune_items pi ON pi.source_run_id=ei.run_id
+                    AND pi.relative_path=ei.path AND pi.status='deleted'
+               WHERE ei.operation='archive' AND ei.classification!='deleted'
+                 AND pi.item_id IS NULL
+               ORDER BY COALESCE(r.completed_at,r.started_at), r.run_id, ei.path"""
+        ).fetchall()]
+
+    def protected_history_runs(self) -> Dict[str, List[str]]:
+        """Return conservative protections; future audit leases plug in here."""
+        protected: Dict[str, List[str]] = {}
+        known = self.connection.execute(
+            "SELECT run_id FROM known_good_state WHERE singleton=1"
+        ).fetchone()
+        if known:
+            protected.setdefault(str(known["run_id"]), []).append("latest_known_good_run")
+        for row in self.connection.execute(
+            "SELECT DISTINCT source_run_id, status FROM restore_runs WHERE status IN ('running','failed')"
+        ):
+            protected.setdefault(str(row["source_run_id"]), []).append(
+                f"{row['status']}_restore_reference"
+            )
+        return protected
+
+    def create_prune_plan(self, prune_id: str, created_at: str,
+                          policy: Dict[str, object], items: Sequence[Dict[str, object]]) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO prune_runs (prune_id,created_at,status,policy_json,planned_files,planned_bytes) VALUES (?,?,'planned',?,?,?)",
+                (prune_id, created_at, json.dumps(policy, sort_keys=True), len(items),
+                 sum(int(item["bytes"]) for item in items)),
+            )
+            self.connection.executemany(
+                """INSERT INTO prune_items
+                   (prune_id,source_run_id,relative_path,historical_path,bytes,mtime_ns,device,inode,checksum,status,detail)
+                   VALUES (?,?,?,?,?,?,?,?,?,'planned',?)""",
+                ((prune_id, item["source_run_id"], item["relative_path"],
+                  item["historical_path"], item["bytes"], item["mtime_ns"],
+                  item["device"], item["inode"], item.get("checksum"), item["reason"])
+                 for item in items),
+            )
+
+    def prune_run(self, prune_id: str) -> Optional[Dict[str, object]]:
+        row = self.connection.execute("SELECT * FROM prune_runs WHERE prune_id=?", (prune_id,)).fetchone()
+        return dict(row) if row else None
+
+    def prune_items(self, prune_id: str) -> List[Dict[str, object]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM prune_items WHERE prune_id=? ORDER BY item_id",
+            (prune_id,),
+        )]
+
+    def begin_prune(self, prune_id: str) -> None:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE prune_runs SET status='running' WHERE prune_id=? AND status='planned'", (prune_id,)
+            )
+            if cursor.rowcount != 1:
+                raise LedgerError(f"prune plan is not executable: {prune_id}")
+
+    def mark_prune_item(self, prune_id: str, source_run_id: str, relative_path: str,
+                        status: str, timestamp: Optional[str], detail: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE prune_items SET status=?,deleted_at=?,detail=? WHERE prune_id=? AND source_run_id=? AND relative_path=?",
+                (status, timestamp, detail, prune_id, source_run_id, relative_path),
+            )
+
+    def finish_prune(self, prune_id: str, executed_at: str, status: str,
+                     deleted_files: int, deleted_bytes: int, errors: Sequence[str]) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE prune_runs SET executed_at=?,status=?,deleted_files=?,deleted_bytes=?,errors_json=? WHERE prune_id=? AND status='running'",
+                (executed_at, status, deleted_files, deleted_bytes, json.dumps(list(errors)), prune_id),
+            )
 
     def logical_renames(self, old_path: str) -> List[Dict[str, object]]:
         """Return non-restorable evidence that an old path moved elsewhere."""

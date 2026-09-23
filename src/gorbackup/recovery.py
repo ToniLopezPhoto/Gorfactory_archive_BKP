@@ -11,6 +11,7 @@ from typing import Callable, Optional, Sequence, Tuple
 
 from gorbackup.config import AppConfig
 from gorbackup.ledger import Ledger, validate_state_location
+from gorbackup.locking import HistoryLock
 from gorbackup.verification import VerificationError, hash_file, validate_relative_path
 
 
@@ -34,6 +35,8 @@ class HistoryVersion:
     path: Path
     exists: bool
     state: Optional[str] = None
+    pruned_by: Optional[str] = None
+    pruned_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -145,7 +148,7 @@ def find_history(config: AppConfig, requested_path: str) -> HistoryResult:
             "history", run_id, row["completed_at"] or row["started_at"],
             str(row["status"]), int(row["size"]), row["checksum"],
             _reason(str(row["classification"]), row["plan_category"]),
-            historical_path, exists,
+            historical_path, exists, None, row.get("pruned_by"), row.get("pruned_at"),
         ))
     for row in logical_renames:
         run_id = validate_run_id(str(row["run_id"]))
@@ -302,6 +305,19 @@ def restore_version(
     # migration before its read-only discovery phase.
     with Ledger(config.ledger_path):
         pass
+    with HistoryLock(config.state_root / ".history-access.lock", exclusive=False):
+        return _restore_version_locked(
+            config, relative, run_id, restore_id, destination=destination, now=now,
+            copier=copier, hasher=hasher, publisher=publisher,
+        )
+
+
+def _restore_version_locked(
+    config: AppConfig, relative: str, run_id: str, restore_id: str, *,
+    destination: Optional[Path], now: Callable[[], datetime],
+    copier: Callable[[Path, Path], int], hasher: Callable[[Path], Tuple[str, int]],
+    publisher: Callable[[Path, Path, str, int], None],
+) -> RestoreResult:
     result = find_history(config, relative)
     matches = [item for item in result.versions if item.run_id == run_id]
     if len(matches) != 1:
@@ -309,6 +325,10 @@ def restore_version(
             f"run {run_id} does not contain one unambiguous historical version of {relative}"
         )
     version = matches[0]
+    if version.pruned_by:
+        raise RecoveryError(
+            f"historical version was deliberately pruned by {version.pruned_by}"
+        )
     if version.run_status not in {"success", "warning"}:
         raise RecoveryError(
             f"run {run_id} is not eligible for restore (status={version.run_status})"

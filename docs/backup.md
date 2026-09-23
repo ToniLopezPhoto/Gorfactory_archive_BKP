@@ -15,10 +15,10 @@ The lock is held from before planning until execution, reconciliation, verificat
 publication, and known-good promotion have finished. It is released by a context
 manager on success, a safety block, rclone/reconciliation failure, manifest
 failure, or an unexpected exception. Thus two `backup` processes cannot reach a
-real `rclone sync` concurrently. Standalone read-only/preparatory commands are not
-locked; future mutable restore or prune operations must reuse this mechanism when
-they are implemented. `baseline --reconcile` remains outside the scope of this
-lock in the current release.
+real `rclone sync` concurrently. Backup then takes `.history-access.lock`
+exclusively; prune uses the same lock order (`BackupLock` then history exclusive),
+while restores use a shared history lock. `baseline --reconcile` remains outside
+the scope of this lock in the current release.
 
 The JSON lock records schema version, PID, hostname, acquisition timestamp,
 attempt identifier, and a random ownership token. Creation uses exclusive

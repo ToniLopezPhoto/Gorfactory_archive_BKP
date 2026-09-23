@@ -103,6 +103,17 @@ gorbackup --config config/config.yaml restore "Campaign/photo.tif" --run <run_id
 See [docs/recovery.md](docs/recovery.md) for destination restrictions,
 verification, conflicts, and restore evidence.
 
+To review and then explicitly remove only eligible ledger-recorded history:
+
+```sh
+gorbackup --config config/config.yaml prune --dry-run
+gorbackup --config config/config.yaml prune --execute <prune_id> --yes
+```
+
+Pruning is never invoked by backup and automatic pruning remains disabled. See
+[docs/retention.md](docs/retention.md) for policy, protections, locking, and
+partial-failure semantics.
+
 ## Development
 
 ```sh
