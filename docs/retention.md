@@ -54,9 +54,9 @@ Restore holds shared `state/.history-access.lock`; backup and prune hold it excl
 Prune uses fixed lock order `BackupLock` then `HistoryLock(EXCLUSIVE)`. Thus concurrent
 restores may coexist, but no restore can race an unlink and backup cannot race prune.
 
-Files are unlinked individually in deterministic order. Empty parents may be removed up
-through their run directory, never above it. Unknown files remain untouched and prevent
-directory cleanup. A mid-run failure marks the prune failed, preserves exact per-item
+Eligible files are unlinked individually in deterministic order. Unregistered content
+under `history/` remains untouched. Empty directories may remain after pruning; this is
+intentional and harmless. A mid-run failure marks the prune failed, preserves exact per-item
 states, and writes `prune-execution-<id>.json`; no rollback is claimed.
 
 History reports intentional removal as `pruned <timestamp> by prune <id>`. Unaccounted

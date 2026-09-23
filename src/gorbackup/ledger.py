@@ -798,7 +798,7 @@ class Ledger:
 
     def prune_items(self, prune_id: str) -> List[Dict[str, object]]:
         return [dict(row) for row in self.connection.execute(
-            "SELECT * FROM prune_items WHERE prune_id=? ORDER BY source_run_id,relative_path",
+            "SELECT * FROM prune_items WHERE prune_id=? ORDER BY item_id",
             (prune_id,),
         )]
 

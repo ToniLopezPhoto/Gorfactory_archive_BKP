@@ -88,6 +88,8 @@ def test_missing_before_prune_is_not_candidate_or_pruned(tmp_path: Path) -> None
 
 def test_successful_prune_retains_unknown_content_and_marks_history(tmp_path: Path) -> None:
     cfg = config(tmp_path)
+    current = cfg.archive.root / "current" / "keep.tif"
+    current.write_bytes(b"live")
     historical = seed(cfg, "old", "Campaña Otoño/Selección José 001.tif", b"old",
                       "2020-01-01T00:00:00+00:00")
     unknown = historical.parents[1] / "unknown.txt"
@@ -95,6 +97,8 @@ def test_successful_prune_retains_unknown_content_and_marks_history(tmp_path: Pa
     plan(cfg)
     result = execute_prune(cfg, "prune-1", yes=True, now=lambda: NOW)
     assert result.status == "success" and not historical.exists()
+    assert current.read_bytes() == b"live"
+    assert historical.parent.is_dir()
     assert unknown.read_text() == "keep"
     execution = json.loads(result.manifest_path.read_text())
     assert "untracked history content prevents directory cleanup" in execution["cleanup_warnings"][0]
@@ -116,6 +120,16 @@ def test_stale_plan_aborts_before_any_delete(tmp_path: Path) -> None:
     with pytest.raises(PruneError, match="stale prune plan"):
         execute_prune(cfg, "prune-1", yes=True)
     assert first.exists() and second.exists()
+
+
+def test_plan_executes_when_date_order_differs_from_run_id_order(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    older = seed(cfg, "z-old", "one.tif", b"one", "2020-01-01T00:00:00+00:00")
+    newer = seed(cfg, "a-new", "two.tif", b"two", "2020-01-02T00:00:00+00:00")
+    plan(cfg)
+    result = execute_prune(cfg, "prune-1", yes=True, now=lambda: NOW)
+    assert result.status == "success"
+    assert not older.exists() and not newer.exists()
 
 
 @pytest.mark.parametrize("bad", ["../../current/x", "/tmp/x"])
@@ -140,6 +154,21 @@ def test_symlink_escape_is_rejected_and_outside_is_intact(tmp_path: Path) -> Non
     path.symlink_to(outside)
     with pytest.raises(PruneError, match="symlink"):
         plan(cfg)
+    assert outside.read_bytes() == b"safe"
+
+
+def test_symlink_substitution_after_plan_aborts_before_deletion(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    first = seed(cfg, "old1", "one.tif", b"one", "2020-01-01T00:00:00+00:00")
+    second = seed(cfg, "old2", "two.tif", b"two", "2020-01-02T00:00:00+00:00")
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"safe")
+    plan(cfg)
+    second.unlink()
+    second.symlink_to(outside)
+    with pytest.raises(PruneError, match="symlink"):
+        execute_prune(cfg, "prune-1", yes=True)
+    assert first.read_bytes() == b"one"
     assert outside.read_bytes() == b"safe"
 
 
