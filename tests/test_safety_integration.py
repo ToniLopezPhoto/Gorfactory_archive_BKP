@@ -1,4 +1,4 @@
-"""Filesystem integration scenarios confined to pytest's temporary directory.
+"""Isolated safety scenarios confined to pytest's temporary directory.
 
 The runner substitutes only rclone, which is not available on every developer
 machine. Planning, safety, execution reconciliation, verification and the
@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,34 +29,69 @@ from gorbackup.planner import create_plan
 from gorbackup.preflight import PreflightError, run_preflight
 from gorbackup.pruning import execute_prune, plan_prune
 from gorbackup.recovery import restore_version
+from gorbackup.renames import execute_local_rename, probe_rename_capabilities
 from gorbackup.safety import SafetyError, assess_plan_safety
 
 
 NOW = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
 
 
+class SandboxViolation(RuntimeError):
+    """A test attempted to use a path outside its pytest-managed sandbox."""
+
+
+class SandboxPaths:
+    def __init__(self, root: Path):
+        self.root = root.resolve(strict=True)
+
+    def check(self, path: Path) -> Path:
+        resolved = path.resolve(strict=False)
+        if not resolved.is_relative_to(self.root):
+            raise SandboxViolation(f"path outside sandbox: {resolved}")
+        return resolved
+
+    def config(self, config: AppConfig, *extra: Path) -> None:
+        for path in (config.source.path, config.source.mount_path,
+                     config.archive.root, config.archive.root / config.archive.current_dir,
+                     config.archive.root / config.archive.history_dir,
+                     config.state_root, *extra):
+            self.check(path)
+
+
 class FixtureRclone:
     """Small local rclone boundary with real file moves and copies."""
 
     def __init__(self, root: Path):
-        self.root = root.resolve()
+        self.paths = SandboxPaths(root)
         self.fail_execution = False
         self.corrupt_execution = False
+        self.transferred_bytes = 0
 
     def __call__(self, command, **kwargs):
-        source, current = (Path(command[2]).resolve(), Path(command[3]).resolve())
-        history = Path(command[command.index("--backup-dir") + 1]).resolve()
-        assert source.is_relative_to(self.root)
-        assert current.is_relative_to(self.root)
-        assert history.is_relative_to(self.root)
-        log = Path(command[command.index("--log-file") + 1])
+        if command[1:3] == ["backend", "features"]:
+            self.paths.check(Path(command[3]))
+            return subprocess.CompletedProcess(command, 0, json.dumps({
+                "Name": "local", "Hashes": ["sha256"],
+                "Features": {"Move": True, "Copy": True},
+            }), "")
+        source = self.paths.check(Path(command[2]))
+        current = self.paths.check(Path(command[3]))
+        history = self.paths.check(Path(command[command.index("--backup-dir") + 1]))
+        log = self.paths.check(Path(command[command.index("--log-file") + 1]))
         dry = "--dry-run" in command
+        combined_path = (self.paths.check(Path(command[command.index("--combined") + 1]))
+                         if dry else None)
         excluded = [command[index + 1].lstrip("/").replace("\\", "")
                     for index, value in enumerate(command[:-1]) if value == "--exclude"]
         source_files = {p.relative_to(source).as_posix(): p for p in source.rglob("*")
                         if p.is_file() and p.relative_to(source).as_posix() not in excluded}
         current_files = {p.relative_to(current).as_posix(): p for p in current.rglob("*")
                          if p.is_file()}
+        # Validate every derived path before the first write or move.
+        for name in source_files.keys() | current_files.keys():
+            self.paths.check(source / name)
+            self.paths.check(current / name)
+            self.paths.check(history / name)
         combined = []
         events = []
         for name in sorted(source_files.keys() | current_files.keys()):
@@ -78,13 +114,14 @@ class FixtureRclone:
                 target = current / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(incoming, target)
+                self.transferred_bytes += incoming.stat().st_size
                 if self.corrupt_execution:
                     target.write_bytes(b"corrupt")
                 events.append({"level": "info", "msg": "Copied (replaced)" if existing
                                else "Copied (new)", "object": name,
                                "size": incoming.stat().st_size})
         if dry:
-            Path(command[command.index("--combined") + 1]).write_text(
+            combined_path.write_text(
                 "\n".join(combined) + "\n", encoding="utf-8")
         log.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
         return subprocess.CompletedProcess(command, 1 if self.fail_execution and not dry else 0,
@@ -93,13 +130,9 @@ class FixtureRclone:
 
 @pytest.fixture
 def sandbox(tmp_path):
+    paths = SandboxPaths(tmp_path)
     source = tmp_path / "source volume" / "catalogue"
     archive = tmp_path / "archive volume"
-    source.mkdir(parents=True)
-    (archive / "current").mkdir(parents=True)
-    (archive / "history").mkdir()
-    (source / ".source-id").write_text("source-id\n", encoding="utf-8")
-    (archive / ".archive-id").write_text("archive-id\n", encoding="utf-8")
     config = AppConfig(
         SourceConfig(source, source.parent, ".source-id", "source-id"),
         ArchiveConfig(archive, "current", "history", ".archive-id", "archive-id"),
@@ -110,11 +143,17 @@ def sandbox(tmp_path):
         RetentionConfig(False, 0, 0),
         LoggingConfig(), StateConfig(Path("state")), RenameOptimizationConfig(False),
     )
+    paths.config(config)
+    source.mkdir(parents=True)
+    (archive / "current").mkdir(parents=True)
+    (archive / "history").mkdir()
+    (source / ".source-id").write_text("source-id\n", encoding="utf-8")
+    (archive / ".archive-id").write_text("archive-id\n", encoding="utf-8")
     return config, FixtureRclone(tmp_path)
 
 
-def put(config, name, content):
-    path = config.source.path / name
+def put(config, runner, name, content):
+    path = runner.paths.check(config.source.path / name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     os.utime(path, (NOW.timestamp() - 86400, NOW.timestamp() - 86400))
@@ -122,6 +161,7 @@ def put(config, name, content):
 
 
 def backup(config, runner, number, **kwargs):
+    runner.paths.config(config)
     return run_backup(config, RcloneInfo("fixture-rclone", (1, 70, 0)),
                       runner=runner, now=lambda: NOW,
                       run_id_factory=lambda: f"backup-{number}", **kwargs)
@@ -130,20 +170,21 @@ def backup(config, runner, number, **kwargs):
 def test_first_sync_update_delete_restore_and_unicode(sandbox, tmp_path):
     config, runner = sandbox
     name = "Campaña José/selección 東京 01.tif"
-    original = put(config, name, b"original")
+    original = put(config, runner, name, b"original")
     first = backup(config, runner, 1)
     assert first.status == "success"
     assert (config.archive.root / "current" / name).read_bytes() == b"original"
-    put(config, name, b"updated-longer")
+    put(config, runner, name, b"updated-longer")
     second = backup(config, runner, 2)
     assert second.status == "success"
     assert (second.history_path / name).read_bytes() == b"original"
     original.unlink()
-    put(config, "new file.tif", b"new")
+    put(config, runner, "new file.tif", b"new")
     third = backup(config, runner, 3)
     assert third.status == "success"
     assert not (config.archive.root / "current" / name).exists()
     assert (third.history_path / name).read_bytes() == b"updated-longer"
+    runner.paths.config(config, tmp_path / "restore old", tmp_path / "restore deleted")
     restored_old = restore_version(config, name, second.run_id,
                                    destination=tmp_path / "restore old")
     restored_deleted = restore_version(config, name, third.run_id,
@@ -155,13 +196,13 @@ def test_first_sync_update_delete_restore_and_unicode(sandbox, tmp_path):
 
 
 def test_preflight_rejects_empty_and_wrong_markers(sandbox):
-    config, _ = sandbox
+    config, runner = sandbox
     def check():
         return run_preflight(config, is_mount=lambda _: True,
                              same_filesystem=lambda *_: False)
     with pytest.raises(PreflightError, match="source contains no data files"):
         check()
-    put(config, "safe.tif", b"safe")
+    put(config, runner, "safe.tif", b"safe")
     assert check().source.file_count == 1
     (config.source.path / ".source-id").write_text("wrong")
     with pytest.raises(PreflightError, match="source identity mismatch"):
@@ -174,9 +215,9 @@ def test_preflight_rejects_empty_and_wrong_markers(sandbox):
 
 def test_failed_execution_never_becomes_known_good(sandbox):
     config, runner = sandbox
-    put(config, "safe.tif", b"safe")
+    put(config, runner, "safe.tif", b"safe")
     first = backup(config, runner, 1)
-    put(config, "safe.tif", b"changed")
+    put(config, runner, "safe.tif", b"changed")
     runner.fail_execution = True
     with pytest.raises(BackupError, match="backup execution or verification failed"):
         backup(config, runner, 2)
@@ -186,9 +227,9 @@ def test_failed_execution_never_becomes_known_good(sandbox):
 
 def test_checksum_mismatch_never_becomes_known_good(sandbox):
     config, runner = sandbox
-    put(config, "safe.tif", b"safe")
+    put(config, runner, "safe.tif", b"safe")
     first = backup(config, runner, 1)
-    put(config, "safe.tif", b"changed")
+    put(config, runner, "safe.tif", b"changed")
     runner.corrupt_execution = True
     with pytest.raises(BackupError, match="backup execution or verification failed"):
         backup(config, runner, 2)
@@ -199,9 +240,9 @@ def test_checksum_mismatch_never_becomes_known_good(sandbox):
 def test_prune_changes_only_fixture_history(sandbox):
     config, runner = sandbox
     name = "José/old.tif"
-    put(config, name, b"old")
+    put(config, runner, name, b"old")
     backup(config, runner, 1)
-    put(config, name, b"new-longer")
+    put(config, runner, name, b"new-longer")
     second = backup(config, runner, 2)
     historical = second.history_path / name
     assert historical.read_bytes() == b"old"
@@ -224,9 +265,10 @@ def test_prune_changes_only_fixture_history(sandbox):
 ])
 def test_rename_or_folder_move_preserves_original(sandbox, old, new):
     config, runner = sandbox
-    source = put(config, old, b"same")
+    source = put(config, runner, old, b"same")
     backup(config, runner, 1)
     target = config.source.path / new
+    runner.paths.check(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     source.rename(target)
     result = backup(config, runner, 2)
@@ -238,8 +280,8 @@ def test_rename_or_folder_move_preserves_original(sandbox, old, new):
 
 def test_mass_delete_blocked_before_file_mutation(sandbox):
     config, runner = sandbox
-    put(config, "one.tif", b"one")
-    put(config, "two.tif", b"two")
+    put(config, runner, "one.tif", b"one")
+    put(config, runner, "two.tif", b"two")
     backup(config, runner, 1)
     (config.source.path / "one.tif").unlink()
     (config.source.path / "two.tif").unlink()
@@ -253,7 +295,7 @@ def test_mass_delete_blocked_before_file_mutation(sandbox):
 def test_recent_file_is_ignored(sandbox):
     config, runner = sandbox
     recent_config = replace(config, safety=replace(config.safety, ignore_recent_minutes=15))
-    path = put(config, "in progress.tif", b"unfinished")
+    path = put(config, runner, "in progress.tif", b"unfinished")
     os.utime(path, (NOW.timestamp(), NOW.timestamp()))
     plan = create_plan(recent_config, RcloneInfo("fixture-rclone", (1, 70, 0)),
                        runner=runner, now=lambda: NOW)
@@ -266,7 +308,7 @@ def test_recent_file_is_ignored(sandbox):
 
 def test_concurrent_backup_stops_before_planning(sandbox):
     config, runner = sandbox
-    put(config, "safe.tif", b"safe")
+    put(config, runner, "safe.tif", b"safe")
     with BackupLock(config.state_root / "backup.lock", run_id="owner", now=lambda: NOW):
         with pytest.raises(LockError):
             backup(config, runner, 1)
@@ -275,7 +317,7 @@ def test_concurrent_backup_stops_before_planning(sandbox):
 
 def test_insufficient_capacity_blocks_execution(sandbox):
     config, runner = sandbox
-    put(config, "safe.tif", b"safe")
+    put(config, runner, "safe.tif", b"safe")
     def no_space(cfg, plan, **kwargs):
         return assess_plan_safety(cfg, plan,
                                   disk_usage=lambda _: SimpleNamespace(total=100, free=0),
@@ -283,3 +325,82 @@ def test_insufficient_capacity_blocks_execution(sandbox):
     with pytest.raises(SafetyError, match="insufficient archive space"):
         backup(config, runner, 1, safety_checker=no_space)
     assert not (config.archive.root / "current" / "safe.tif").exists()
+
+
+@pytest.mark.parametrize("field", ["source", "current", "history", "log", "combined"])
+def test_fixture_rejects_external_paths_before_mutation(sandbox, tmp_path, field):
+    config, runner = sandbox
+    put(config, runner, "safe.tif", b"safe")
+    outside = tmp_path.parent / f"outside-{field}"
+    command = ["fixture-rclone", "sync", str(config.source.path),
+               str(config.archive.root / "current"), "--dry-run",
+               "--backup-dir", str(config.archive.root / "history" / "run"),
+               "--log-file", str(config.state_root / "log.jsonl"),
+               "--combined", str(config.state_root / "combined.txt")]
+    position = {"source": 2, "current": 3, "history": 6,
+                "log": 8, "combined": 10}[field]
+    command[position] = str(outside)
+    with pytest.raises(SandboxViolation, match="outside sandbox"):
+        runner(command)
+    assert not outside.exists()
+    assert not (config.state_root / "log.jsonl").exists()
+    assert not (config.state_root / "combined.txt").exists()
+
+
+def test_config_and_restore_staging_cannot_leave_sandbox(sandbox, tmp_path):
+    config, runner = sandbox
+    outside = tmp_path.parent / "outside-stage"
+    with pytest.raises(SandboxViolation, match="outside sandbox"):
+        runner.paths.config(replace(config, state=StateConfig(outside)))
+    with pytest.raises(SandboxViolation, match="outside sandbox"):
+        runner.paths.config(config, outside)
+    assert not outside.exists()
+
+
+def portable_no_replace(old_fd, old_name, new_fd, new_name):
+    """Linux test primitive: hard-link fails if destination already exists."""
+    os.link(old_name, new_name, src_dir_fd=old_fd, dst_dir_fd=new_fd)
+    os.unlink(old_name, dir_fd=old_fd)
+
+
+@pytest.mark.parametrize("old,new", [
+    ("old.tif", "new.tif"),
+    ("old folder/José.tif", "new folder/José.tif"),
+])
+def test_optimized_rename_without_retransmission(sandbox, old, new):
+    config, runner = sandbox
+    optimized = replace(config, rename_optimization=RenameOptimizationConfig(True))
+    source = put(config, runner, old, b"same")
+    first = backup(optimized, runner, 1)
+    previous = config.archive.root / "current" / old
+    old_inode = previous.stat().st_ino
+    target = config.source.path / new
+    runner.paths.check(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.rename(target)
+    # Exercise the production capability probe with only its external process
+    # simulated. Use the native primitive on macOS and the portable test
+    # primitive on Linux; prove_identity and execute_local_rename remain real.
+    def probe(info, src, dst):
+        return probe_rename_capabilities(info, src, dst, runner=runner)
+    def rename(current, proven):
+        if sys.platform == "darwin":
+            execute_local_rename(current, proven)
+        else:
+            execute_local_rename(current, proven, primitive=portable_no_replace)
+    bytes_before = runner.transferred_bytes
+    second = backup(optimized, runner, 2, capability_prober=probe,
+                    rename_executor=rename)
+    assert second.status == "success"
+    assert second.executed_rename_files == 1
+    assert second.executed_transfer_files == 0
+    assert runner.transferred_bytes == bytes_before
+    assert not previous.exists()
+    current = config.archive.root / "current" / new
+    assert current.read_bytes() == b"same"
+    assert current.stat().st_ino == old_inode
+    with Ledger(config.ledger_path) as ledger:
+        assert ledger.known_good_state()["run_id"] == second.run_id
+        items = ledger.execution_items(second.run_id)
+        assert [(item["operation"], item["path"], item["related_path"])
+                for item in items] == [("rename", new, old)]
